@@ -1,0 +1,20 @@
+# UML VM Configuration
+# Network: VDE VECTOR transport with libslirp NAT
+#
+# IPv4: guest 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3
+# IPv6: guest fec0::15/64, gateway fec0::2, DNS fec0::3
+
+memory: 2G
+# Number of vCPUs for the guest (UML SMP). Requires a kernel built with
+# CONFIG_SMP (our 6.18.x/6.19+ builds have it). The launcher auto-adds
+# `seccomp=on` when ncpus > 1. Ignored on UP kernels.
+ncpus: 1
+
+ipv4: true
+ipv6: true
+
+# Port forwarding: "hostport:guestport" or "udp hostport:guestport"
+portfwd: true
+ports:
+  - "2222:22"          # SSH
+  - "8006:8006"
