@@ -158,6 +158,40 @@ need_install() {
   return 1
 }
 
+# Ensure e2fsck/resize2fs are usable on host. Falls back to installing
+# e2fsprogs into $BASE/.tools via apt (no root needed: apt-get download +
+# dpkg-deb -x), e.g. for Pterodactyl containers without e2fsprogs.
+ensure_e2fsprogs() {
+  if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
+    return 0
+  fi
+  local prefix="$BASE/.tools/e2fsprogs"
+  if [ -x "$prefix/usr/sbin/resize2fs" ] || [ -x "$prefix/sbin/resize2fs" ]; then
+    export PATH="$prefix/usr/sbin:$prefix/sbin:$PATH"
+    export LD_LIBRARY_PATH="$prefix/usr/lib/x86_64-linux-gnu:$prefix/usr/lib:$prefix/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    return 0
+  fi
+  command -v apt-get >/dev/null 2>&1 || return 1
+  command -v dpkg-deb >/dev/null 2>&1 || return 1
+  echo "==> e2fsprogs not on host, installing into $prefix ..."
+  mkdir -p "$prefix/apt/lists/partial" "$prefix/apt/cache/archives/partial" "$prefix/debs"
+  local apt="apt-get -o Debug::NoLocking=1 -o Dir::State::Lists=$prefix/apt/lists -o Dir::Cache=$prefix/apt/cache"
+  $apt update >/dev/null 2>&1 || true
+  local libs
+  libs=$(apt-cache -o Debug::NoLocking=1 -o Dir::State::Lists=$prefix/apt/lists depends --important e2fsprogs 2>/dev/null | awk '/Depends:|PreDepends:/{print $2}' | grep '^lib' | sort -u | tr '\n' ' ') || true
+  # shellcheck disable=SC2086
+  (cd "$prefix/debs" && $apt download e2fsprogs $libs >/dev/null 2>&1) || return 1
+  local deb
+  for deb in "$prefix"/debs/*.deb; do
+    [ -f "$deb" ] || return 1
+    dpkg-deb -x "$deb" "$prefix" || return 1
+  done
+  [ -x "$prefix/usr/sbin/resize2fs" ] || [ -x "$prefix/sbin/resize2fs" ] || return 1
+  export PATH="$prefix/usr/sbin:$prefix/sbin:$PATH"
+  export LD_LIBRARY_PATH="$prefix/usr/lib/x86_64-linux-gnu:$prefix/usr/lib:$prefix/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  return 0
+}
+
 do_install() {
   local want="$1"
   if [ -z "$want" ]; then
@@ -223,15 +257,16 @@ do_install() {
       else
         echo "==> Resizing base.img to $disk..."
         truncate -s "$disk" "$ROOTFS"
+        ensure_e2fsprogs || true
         if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
           e2fsck -f -y "$ROOTFS"
           resize2fs "$ROOTFS"
         else
-          # No e2fsprogs on host (e.g. Pterodactyl): container grown, grow the
-          # filesystem from inside the guest after boot (online grow needs no fsck):
+          # Last resort (no apt either): container grown, grow the filesystem
+          # from inside the guest after boot (online grow needs no fsck):
           #   resize2fs /dev/ubda
           # (cloud-init growpart may already do this automatically on first boot.)
-          echo "(!) e2fsck/resize2fs not on host: container grown to $disk."
+          echo "(!) e2fsprogs unavailable on host: container grown to $disk."
           echo "    After boot, grow the filesystem inside the guest:"
           echo "      resize2fs /dev/ubda"
         fi
