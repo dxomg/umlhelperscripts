@@ -277,11 +277,27 @@ do_boot() {
       ;;
   esac
 
-  # skas0 fallback needs a local tmpdir; seccomp mode does not.
-  if [ -n "$SKAS_MODE" ]; then
+  # Pick an exec-capable tmpdir for UML (kernel checks $TMPDIR first,
+  # then /dev/shm; Docker/Pterodactyl often mount /dev/shm noexec while
+  # /tmp is tmpfs exec). Always export so the kernel finds it.
+  pick_exec_tmpdir() {
+    local d t
+    for d in "${TMPDIR:-}" /tmp /dev/shm; do
+      [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] || continue
+      t=$(mktemp "$d/.uml_exec_XXXXXX" 2>/dev/null) || continue
+      printf '#!/bin/sh\nexit 0\n' > "$t"
+      chmod +x "$t" 2>/dev/null
+      if "$t" 2>/dev/null; then rm -f "$t"; echo "$d"; return 0; fi
+      rm -f "$t"
+    done
     mkdir -p "$BASE/.uml_tmp"
-    export TMP="$BASE/.uml_tmp" TMPDIR="$BASE/.uml_tmp" TEMP="$BASE/.uml_tmp"
-  fi
+    echo "$BASE/.uml_tmp"
+  }
+
+  UML_TMPDIR="$(pick_exec_tmpdir)"
+  export TMP="$UML_TMPDIR" TMPDIR="$UML_TMPDIR" TEMP="$UML_TMPDIR"
+  # Best effort: allow exec on /dev/shm when privileged (harmless if denied).
+  mount -o remount,exec /dev/shm 2>/dev/null || true
 
   export PATH="$BASE:$PATH"
 
@@ -304,7 +320,7 @@ do_boot() {
   echo "========================================"
   echo ""
 
-  cleanup() { if [ -n "$SKAS_MODE" ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
+  cleanup() { if [ "$UML_TMPDIR" = "$BASE/.uml_tmp" ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
   trap cleanup EXIT
 
   exec "$KERNEL" \
