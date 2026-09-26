@@ -72,6 +72,9 @@ Options:
                     Env: UML_IMAGE (same values). Interactive prompt if TTY
                     and unset, otherwise default: ${DEFAULT_DISTRO}
   -l, --list        List available images and exit
+  --mode MODE       Userspace mode: seccomp (default), skas0, auto.
+                    Env: UML_MODE. seccomp avoids /dev/shm via memfd
+                    backport; skas0 forces PTRACE fallback.
   --reinstall       Force re-download even if files exist
   --install-only    Install but do not boot
   -h, --help        Show this help
@@ -121,6 +124,7 @@ resolve_image() {
 
 # --- parse args (flags + legacy [memory] [ncpus] positionals) ---
 WANT_IMAGE="${UML_IMAGE:-}"
+UML_MODE="${UML_MODE:-seccomp}"
 REINSTALL=0
 INSTALL_ONLY=0
 POS=()
@@ -128,6 +132,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -i|--image) WANT_IMAGE="${2:-}"; shift 2 ;;
     --image=*) WANT_IMAGE="${1#--image=}"; shift ;;
+    --mode) UML_MODE="${2:-}"; shift 2 ;;
+    --mode=*) UML_MODE="${1#--mode=}"; shift ;;
     -l|--list) list_images; exit 0 ;;
     --reinstall) REINSTALL=1; shift ;;
     --install-only) INSTALL_ONLY=1; shift ;;
@@ -234,17 +240,45 @@ do_boot() {
   SMP_ARGS=""
   SKAS_MODE=""
 
-  if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$ncpus" -gt 1 ]; then
-    SMP_ARGS="ncpus=$ncpus seccomp=on"
-  elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
-    SMP_ARGS="ncpus=1 seccomp=on"
-  else
-    if [ "$SHM_OK" -eq 0 ]; then
-      SKAS_MODE="mode=skas0"
-    fi
-  fi
+  # Userspace mode (default: seccomp instead of skas0).
+  #   seccomp: always pass seccomp=on (memfd physmem backport, no /dev/shm dep).
+  #   skas0:   force PTRACE fallback when /dev/shm is slow.
+  #   auto:    legacy behavior (seccomp on SMP kernels, skas0 fallback on UP).
+  case "$UML_MODE" in
+    seccomp)
+      if [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+        SMP_ARGS="ncpus=$ncpus seccomp=on"
+      else
+        SMP_ARGS="seccomp=on"
+      fi
+      ;;
+    skas0)
+      if [ "$SHM_OK" -eq 0 ]; then
+        SKAS_MODE="mode=skas0"
+      fi
+      if [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+        SMP_ARGS="ncpus=$ncpus"
+      fi
+      ;;
+    auto)
+      if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$ncpus" -gt 1 ]; then
+        SMP_ARGS="ncpus=$ncpus seccomp=on"
+      elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+        SMP_ARGS="ncpus=1 seccomp=on"
+      else
+        if [ "$SHM_OK" -eq 0 ]; then
+          SKAS_MODE="mode=skas0"
+        fi
+      fi
+      ;;
+    *)
+      echo "[ERROR] Invalid UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2
+      exit 1
+      ;;
+  esac
 
-  if [ "$SHM_OK" -eq 0 ]; then
+  # skas0 fallback needs a local tmpdir; seccomp mode does not.
+  if [ -n "$SKAS_MODE" ]; then
     mkdir -p "$BASE/.uml_tmp"
     export TMP="$BASE/.uml_tmp" TMPDIR="$BASE/.uml_tmp" TEMP="$BASE/.uml_tmp"
   fi
@@ -263,7 +297,7 @@ do_boot() {
   fi
   echo "  Memory   : $memory"
   echo "  Network  : VDE VECTOR + libslirp NAT"
-  if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; fi
+  if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; else echo "  Userspace: seccomp"; fi
   echo "  Config   : $CONFIG"
   echo "----------------------------------------"
   echo "  Login: root / root"

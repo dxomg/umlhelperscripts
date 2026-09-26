@@ -11,10 +11,12 @@ yaml_val() {
 }
 
 # --- arguments: [memory] [ncpus]  (both optional, config.yaml overrides) ---
-MEMORY="${1:-$(yaml_val memory)}"
+# Env overrides: MEMORY, NCPUS, UML_MODE (seccomp|skas0|auto, default seccomp)
+MEMORY="${1:-${MEMORY:-$(yaml_val memory)}}"
 MEMORY="${MEMORY:-2G}"
-NCPUS="${2:-$(yaml_val ncpus)}"
+NCPUS="${2:-${NCPUS:-$(yaml_val ncpus)}}"
 NCPUS="${NCPUS:-1}"
+UML_MODE="${UML_MODE:-seccomp}"
 # coerce to a positive integer (ignore garbage from config/argv)
 case "$NCPUS" in
     ''|*[!0-9]*) NCPUS=1 ;;
@@ -48,27 +50,48 @@ fi
 #
 # SMP rules (upstream UML since v6.19):
 #   * ncpus=N       how many vCPUs to bring online (<= NR_CPUS, default 1).
-#   * seccomp=on    REQUIRED for ncpus>1. SMP is incompatible with the
-#                    default PTRACE userspace mode; it must use seccomp.
-#                    Harmless for ncpus=1 / UP kernels.
+#   * seccomp=on    Default userspace mode (memfd physmem backport, avoids
+#   *               the /dev/shm dependency). REQUIRED for ncpus>1.
 #   * mode=skas0    forces PTRACE userspace (TT-less). INCOMPATIBLE with
-#                    SMP, so only used when ncpus==1 AND /dev/shm is slow.
-#                    (seccomp mode already avoids the /dev/shm dependency
-#                    via the memfd physmem backport.)
+#   *               SMP, only used on explicit UML_MODE=skas0 when /dev/shm
+#   *               is slow. Set UML_MODE=auto for legacy auto behavior.
 SMP_ARGS=""
 SKAS_MODE=""
 
-if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$NCPUS" -gt 1 ]; then
-    SMP_ARGS="ncpus=$NCPUS seccomp=on"
-elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
-    SMP_ARGS="ncpus=1 seccomp=on"
-else
-    if [ "$SHM_OK" -eq 0 ]; then
-        SKAS_MODE="mode=skas0"
-    fi
-fi
+case "$UML_MODE" in
+    seccomp)
+        if [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+            SMP_ARGS="ncpus=$NCPUS seccomp=on"
+        else
+            SMP_ARGS="seccomp=on"
+        fi
+        ;;
+    skas0)
+        if [ "$SHM_OK" -eq 0 ]; then
+            SKAS_MODE="mode=skas0"
+        fi
+        if [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+            SMP_ARGS="ncpus=$NCPUS"
+        fi
+        ;;
+    auto)
+        if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$NCPUS" -gt 1 ]; then
+            SMP_ARGS="ncpus=$NCPUS seccomp=on"
+        elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+            SMP_ARGS="ncpus=1 seccomp=on"
+        else
+            if [ "$SHM_OK" -eq 0 ]; then
+                SKAS_MODE="mode=skas0"
+            fi
+        fi
+        ;;
+    *)
+        echo "[ERROR] Invalid UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2
+        exit 1
+        ;;
+esac
 
-if [ "$SHM_OK" -eq 0 ]; then
+if [ -n "$SKAS_MODE" ]; then
     mkdir -p "$BASE/.uml_tmp"
     export TMP="$BASE/.uml_tmp" TMPDIR="$BASE/.uml_tmp" TEMP="$BASE/.uml_tmp"
 fi
@@ -87,7 +110,7 @@ else
 fi
 echo "  Memory   : $MEMORY"
 echo "  Network  : VDE VECTOR + libslirp NAT"
-if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; fi
+if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; else echo "  Userspace: seccomp"; fi
 echo "  Config   : $CONFIG"
 echo "----------------------------------------"
 echo "  Login: root / root"
