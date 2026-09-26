@@ -5,7 +5,7 @@ echo "==> Downloading latest UML kernel, networking tools, and Debian image..."
 wget -q --show-progress -O linux https://github.com/dxomg/uml-kernel-build/releases/latest/download/linux-uml
 wget -q --show-progress https://github.com/dxomg/uml-kernel-build/releases/latest/download/slirp
 wget -q --show-progress https://github.com/dxomg/uml-kernel-build/releases/latest/download/vde_plug
-wget -q --show-progress https://github.com/dxomg/umlmox/releases/latest/download/debian.img.xz
+
 
 echo "==> Downloading helper scripts and configuration..."
 wget -q --show-progress https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/startuml.sh
