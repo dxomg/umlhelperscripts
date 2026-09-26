@@ -69,6 +69,9 @@ Options:
                     or full asset (base-debian-trixie.img.gz).
                     Env: UML_IMAGE (same values). Interactive prompt if TTY
                     and unset, otherwise default: ${DEFAULT_DISTRO}
+  -d, --disk SIZE   Resize base.img to SIZE (e.g. 20G) after install.
+                    Env: UML_DISK_SIZE. Interactive prompt if TTY
+                    and unset, otherwise disk is left as-downloaded.
   -l, --list        List available images and exit
   --mode MODE       Userspace mode: seccomp (default), skas0, auto.
                     Env: UML_MODE. seccomp avoids /dev/shm via memfd
@@ -122,6 +125,7 @@ resolve_image() {
 
 # --- parse args (flags + legacy [memory] [ncpus] positionals) ---
 WANT_IMAGE="${UML_IMAGE:-}"
+WANT_DISK="${UML_DISK_SIZE:-}"
 UML_MODE="${UML_MODE:-seccomp}"
 REINSTALL=0
 INSTALL_ONLY=0
@@ -130,6 +134,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -i|--image) WANT_IMAGE="${2:-}"; shift 2 ;;
     --image=*) WANT_IMAGE="${1#--image=}"; shift ;;
+    -d|--disk) WANT_DISK="${2:-}"; shift 2 ;;
+    --disk=*) WANT_DISK="${1#--disk=}"; shift ;;
     --mode) UML_MODE="${2:-}"; shift 2 ;;
     --mode=*) UML_MODE="${1#--mode=}"; shift ;;
     -l|--list) list_images; exit 0 ;;
@@ -192,6 +198,46 @@ do_install() {
   echo "==> Extracting rootfs image to base.img..."
   gunzip -f "$BASE/rootfs.img.gz"
   mv -f "$BASE/rootfs.img" "$ROOTFS"
+
+  # --- optional disk resize on first install (e.g. truncate -s 20G base.img) ---
+  local disk="$WANT_DISK"
+  if [ -z "$disk" ] && [ -t 0 ]; then
+    echo ""
+    echo "Current disk size: $(du -h "$ROOTFS" | cut -f1) ($ROOTFS)"
+    read -rp "Resize disk? New size (e.g. 20G, empty = keep current): " disk
+  fi
+  if [ -n "${disk:-}" ]; then
+    if [[ ! "$disk" =~ ^[0-9]+[KkMmGg]$ ]]; then
+      echo "(!) Invalid disk size '$disk' (use e.g. 20G), keeping current size." >&2
+    else
+      local num="${disk%[KkMmGg]}" suf="${disk: -1}" mult=1
+      case "$suf" in
+        K|k) mult=1024 ;;
+        M|m) mult=$((1024*1024)) ;;
+        G|g) mult=$((1024*1024*1024)) ;;
+      esac
+      local want_bytes=$((num*mult)) cur_bytes
+      cur_bytes=$(stat -c%s "$ROOTFS" 2>/dev/null || stat -f%z "$ROOTFS" 2>/dev/null || echo 0)
+      if [ "$want_bytes" -lt "$cur_bytes" ]; then
+        echo "(!) $disk is smaller than current image, refusing to shrink." >&2
+      else
+        echo "==> Resizing base.img to $disk..."
+        truncate -s "$disk" "$ROOTFS"
+        if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
+          e2fsck -f -y "$ROOTFS"
+          resize2fs "$ROOTFS"
+        else
+          # No e2fsprogs on host (e.g. Pterodactyl): container grown, grow the
+          # filesystem from inside the guest after boot (online grow needs no fsck):
+          #   resize2fs /dev/ubda
+          # (cloud-init growpart may already do this automatically on first boot.)
+          echo "(!) e2fsck/resize2fs not on host: container grown to $disk."
+          echo "    After boot, grow the filesystem inside the guest:"
+          echo "      resize2fs /dev/ubda"
+        fi
+      fi
+    fi
+  fi
 
   echo "==> Install complete: kernel=${KERNEL_ASSET}, image=${image_gz} -> base.img"
   echo ""
