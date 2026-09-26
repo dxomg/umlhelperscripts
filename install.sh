@@ -173,7 +173,7 @@ chmod +x linux vde_plug startuml.sh resizeimg.sh
 
 echo "==> Extracting rootfs image to base.img..."
 gunzip -f rootfs.img.gz
-mv -f rootfs base.img
+mv -f rootfs.img base.img
 
 echo "==> Setup complete!"
 echo ""
