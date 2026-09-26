@@ -121,6 +121,9 @@ echo ""
 cleanup() { if [ "$UML_TMPDIR" = "$BASE/.uml_tmp" ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
 trap cleanup EXIT
 
+# Pterodactyl startup detection: egg "startup": {"done": "Server started"}
+echo "Server started"
+
 exec "$KERNEL" \
     mem="$MEMORY" \
     $SKAS_MODE \

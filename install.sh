@@ -11,14 +11,12 @@ case "$UNAME_M" in
     ARCH_LABEL="x86_64"
     IMG_SUFFIX=""        # e.g. base-debian-trixie.img.gz
     KERNEL_ASSET="linux-uml"
-    SLIRP_ASSET="slirp-x86_64"
     VDE_ASSET="vde_plug-x86_64"
     ;;
   aarch64|arm64)
     ARCH_LABEL="arm64"
     IMG_SUFFIX="-arm64"  # e.g. base-debian-trixie-arm64.img.gz
     KERNEL_ASSET="linux-uml-arm64"
-    SLIRP_ASSET="slirp-arm64"
     VDE_ASSET="vde_plug-arm64"
     ;;
   *)
@@ -84,8 +82,8 @@ while [ $# -gt 0 ]; do
     -l|--list) ACTION="list"; shift ;;
     -a|--arch)
       case "${2:-}" in
-        x86_64|amd64) IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; SLIRP_ASSET="slirp-x86_64"; VDE_ASSET="vde_plug-x86_64"; ARCH_LABEL="x86_64" ;;
-        arm64|aarch64) IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; SLIRP_ASSET="slirp-arm64"; VDE_ASSET="vde_plug-arm64"; ARCH_LABEL="arm64" ;;
+        x86_64|amd64) IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64"; ARCH_LABEL="x86_64" ;;
+        arm64|aarch64) IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"; ARCH_LABEL="arm64" ;;
         *) echo "Invalid --arch: $2 (use x86_64|arm64)" >&2; exit 1 ;;
       esac
       shift 2 ;;
@@ -153,11 +151,9 @@ echo ""
 echo "==> Downloading latest UML kernel and networking tools..."
 wget -q --show-progress -O linux "${BASE_URL}/${KERNEL_ASSET}"
 wget -q --show-progress -O vde_plug "${BASE_URL}/${VDE_ASSET}"
-# slirp was dropped from newer releases (e.g. v2026.09.26-18) - best effort only
-if ! wget -q --show-progress -O slirp "${BASE_URL}/${SLIRP_ASSET}"; then
-  echo "(!) ${SLIRP_ASSET} not found in latest release, skipping (newer releases omit slirp)."
-  rm -f slirp
-fi
+# NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
+# networking is provided via vde_plug, so no slirp download needed.
+rm -f slirp
 
 echo "==> Downloading rootfs image ${IMAGE_GZ}..."
 wget -q --show-progress -O rootfs.img.gz "${BASE_URL}/${IMAGE_GZ}"
