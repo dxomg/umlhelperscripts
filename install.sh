@@ -353,6 +353,7 @@ echo ""
 echo "Installed:"
 echo "  - kernel : ${KERNEL_ASSET} -> $DATA_DIR/linux"
 echo "  - image  : ${IMAGE_GZ} -> $DATA_DIR/base.img"
+echo "  - marker : $DATA_DIR/.installed"
 if [ -n "${SLIRP_ASSET:-}${STUB_ASSET:-}" ]; then
   echo "  - helpers: ${VDE_ASSET}, ${SLIRP_ASSET:-none}, ${STUB_ASSET:-none}"
 fi
@@ -364,6 +365,17 @@ fi
   echo "image=${IMAGE_GZ}"
   echo "arch=${ARCH_LABEL}"
 } > "$DATA_DIR/.uml_manifest" 2>/dev/null || true
+# Explicit install sentinel: "is it installed?" is a single file test.
+{
+  echo "# UML helpers install sentinel (informational)"
+  echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+  echo "kernel=${KERNEL_ASSET}"
+  echo "vde=${VDE_ASSET}"
+  echo "slirp=${SLIRP_ASSET:-none}"
+  echo "stub=${STUB_ASSET:-none}"
+  echo "image=${IMAGE_GZ}"
+  echo "arch=${ARCH_LABEL}"
+} > "$DATA_DIR/.installed" 2>/dev/null || true
 echo ""
 echo "Next steps:"
 echo "  - (Optional) Resize your image: ./resizeimg.sh \"$DATA_DIR/base.img\" <SIZE>"

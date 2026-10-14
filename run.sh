@@ -540,6 +540,30 @@ manifest_val() { # manifest_val KEY (empty when absent; always succeeds)
   grep -E "^${1}=" "$(manifest_path)" 2>/dev/null | head -1 | cut -d= -f2- || true
 }
 
+# Explicit install sentinel: $DATA_DIR/.installed, written LAST on a
+# successful install (and refreshed when helpers change). "Is it installed?"
+# is a single file test. Pre-sentinel installs are still recognised via core
+# files + manifest, and get backfilled on the next run.
+write_installed_marker() { # write_installed_marker IMAGE_GZ
+  {
+    echo "# UML helpers install sentinel (informational)"
+    echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+    echo "kernel=${KERNEL_ASSET}"
+    echo "vde=${VDE_ASSET}"
+    echo "slirp=${SLIRP_ASSET:-none}"
+    echo "stub=${STUB_ASSET:-none}"
+    echo "image=${1:-}"
+    echo "arch=${ARCH_LABEL}"
+  } > "$DATA_DIR/.installed" 2>/dev/null || true
+}
+ensure_installed_marker() {
+  [ -f "$DATA_DIR/.installed" ] && return 0
+  write_installed_marker "$(manifest_val image)"
+}
+installed_date() { # installed_date (empty when unknown; always succeeds)
+  grep -E "^installed=" "$DATA_DIR/.installed" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
 # Refresh helpers when the mapping drifted (or Android extras are missing),
 # without touching base.img. Best effort: on download failure the existing
 # files are kept and boot proceeds to preflight.
@@ -577,6 +601,7 @@ refresh_android_helpers() {
     [ -f "$DATA_DIR/stub_exe" ] && chmod +x "$DATA_DIR/stub_exe" 2>/dev/null || true
   fi
   write_manifest "$(manifest_val image)"
+  write_installed_marker "$(manifest_val image)"
   return 0
 }
 
@@ -693,11 +718,13 @@ do_install() {
     persist_config_mode "$UML_MODE" && echo "==> Userspace mode '$UML_MODE' saved to $CONFIG"
   fi
   write_manifest "$image_gz"
+  write_installed_marker "$image_gz"
 
   echo "==> Install complete: kernel=${KERNEL_ASSET}, image=${image_gz} -> base.img"
   if [ -n "${SLIRP_ASSET:-}${STUB_ASSET:-}" ]; then
     echo "    helpers: ${VDE_ASSET}, ${SLIRP_ASSET:-none}, ${STUB_ASSET:-none}"
   fi
+  echo "    marker : $DATA_DIR/.installed"
   echo ""
 }
 
@@ -891,7 +918,15 @@ if need_install; then
   echo "==> First run: installing UML environment..."
   do_install "$WANT_IMAGE"
 else
-  echo "==> Existing install found, skipping download."
+  _when="$(installed_date)"
+  if [ -n "$_when" ]; then
+    echo "==> Existing install found (installed $_when), skipping download."
+  else
+    echo "==> Existing install found, skipping download."
+  fi
+  # Pre-sentinel installs are recognised via files+manifest; backfill the
+  # explicit marker so `test -f .installed` works going forward.
+  ensure_installed_marker
 fi
 
 if [ "$INSTALL_ONLY" -eq 1 ]; then
