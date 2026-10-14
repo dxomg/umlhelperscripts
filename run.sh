@@ -223,6 +223,9 @@ Options:
                     Env: UML_DATA_DIR.
   --console MODE    Guest console: fd (default, stdio, Pterodactyl-safe),
                     xterm, none. Env: UML_CONSOLE.
+  --init PATH       Guest init binary (default: /lib/systemd/systemd).
+                    Env: UML_INIT (flag wins), config `init:`.
+                    Rescue/debug: --init /bin/sh (skips systemd entirely).
   --mode MODE       Userspace mode: seccomp (default, skas0 on Android),
                     skas0, auto.
                     Env: UML_MODE. seccomp avoids /dev/shm via memfd
@@ -310,6 +313,8 @@ while [ $# -gt 0 ]; do
     --data-dir=*) DATA_DIR="${1#--data-dir=}"; KERNEL="$DATA_DIR/linux"; ROOTFS="$DATA_DIR/base.img"; CONFIG="$DATA_DIR/config.yaml"; mkdir -p "$DATA_DIR"; shift ;;
     --console) UML_CONSOLE="${2:-fd}"; shift 2 ;;
     --console=*) UML_CONSOLE="${1#--console=}"; shift ;;
+    --init) UML_INIT_ARG="${2:-}"; shift 2 ;;
+    --init=*) UML_INIT_ARG="${1#--init=}"; shift ;;
     --mode) UML_MODE="${2:-}"; MODE_EXPLICIT=1; shift 2 ;;
     --mode=*) UML_MODE="${1#--mode=}"; MODE_EXPLICIT=1; shift ;;
     -l|--list) list_images; exit 0 ;;
@@ -760,6 +765,9 @@ do_boot() {
     ''|*[!0-9]*) ncpus=1 ;;
   esac
   [ "$ncpus" -lt 1 ] && ncpus=1
+  # Guest init: --init flag > UML_INIT env > config `init:` > systemd.
+  local init_bin="${UML_INIT_ARG:-${UML_INIT:-$(yaml_val init)}}"
+  init_bin="${init_bin:-/lib/systemd/systemd}"
 
   for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
     if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f (run with --reinstall?)"; exit 1; fi
@@ -868,6 +876,7 @@ do_boot() {
   echo "  Memory   : $memory"
   echo "  Network  : VDE VECTOR + libslirp NAT"
   if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; else echo "  Userspace: seccomp"; fi
+  echo "  Init     : $init_bin"
   echo "  Config   : $CONFIG"
   echo "  Data     : $DATA_DIR"
   echo "  Tmp      : $UML_TMPDIR"
@@ -909,7 +918,7 @@ do_boot() {
     $SMP_ARGS \
     ubd0="$ROOTFS" \
     root=/dev/ubda rw \
-    init=/lib/systemd/systemd \
+    init="$init_bin" \
     "vec0:transport=vde,vnl=slirp://" \
     $CON_ARGS
 }

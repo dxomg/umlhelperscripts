@@ -79,6 +79,7 @@ if [ "${1:-}" = "--arch" ] || [ "${1:-}" = "-a" ]; then
 fi
 if [ "${1:-}" = "--env" ]; then UML_ENV="${2:-auto}"; shift 2; fi
 if [ "${1:-}" = "--console" ]; then UML_CONSOLE="${2:-fd}"; shift 2; fi
+if [ "${1:-}" = "--init" ]; then UML_INIT_ARG="${2:-}"; shift 2; fi
 if [ "${1:-}" = "--data-dir" ]; then
   DATA_DIR="$2"; KERNEL="$DATA_DIR/linux"; ROOTFS="$DATA_DIR/base.img"; CONFIG="$DATA_DIR/config.yaml"
   shift 2
@@ -129,6 +130,9 @@ if [ -z "${UML_MODE:-}" ]; then
     if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
   fi
 fi
+# Guest init: --init flag > UML_INIT env > config `init:` > systemd.
+INIT_BIN="${UML_INIT_ARG:-${UML_INIT:-$(yaml_val init)}}"
+INIT_BIN="${INIT_BIN:-/lib/systemd/systemd}"
 
 for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
     if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f (run ./run.sh --reinstall or ./install.sh first)"; exit 1; fi
@@ -252,6 +256,7 @@ fi
 echo "  Memory   : $MEMORY"
 echo "  Network  : VDE VECTOR + libslirp NAT"
 if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; else echo "  Userspace: seccomp"; fi
+echo "  Init     : $INIT_BIN"
 echo "  Config   : $CONFIG"
 echo "  Data     : $DATA_DIR"
 echo "----------------------------------------"
@@ -289,6 +294,6 @@ exec "$KERNEL" \
     $SMP_ARGS \
     ubd0="$ROOTFS" \
     root=/dev/ubda rw \
-    init=/lib/systemd/systemd \
+    init="$INIT_BIN" \
     "vec0:transport=vde,vnl=slirp://" \
     $CON_ARGS
