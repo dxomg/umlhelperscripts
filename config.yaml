@@ -32,6 +32,7 @@ ports:
 # arch: auto            # auto | x86_64 | arm64
 # console: fd           # fd | xterm | none
 # mode: seccomp         # seccomp | skas0 | auto
-# init: /lib/systemd/systemd   # guest init binary; /bin/sh for rescue
+# init: /lib/systemd/systemd   # guest init override (default: auto-detected
+                                # from the image: systemd path, else Alpine /sbin/init)
 # data_dir: ""          # e.g. ~/.local/share/uml (empty = script dir)
 # tmp_dir: ""           # empty = auto (.uml_tmp on Pterodactyl, /tmp on standard)

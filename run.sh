@@ -223,8 +223,9 @@ Options:
                     Env: UML_DATA_DIR.
   --console MODE    Guest console: fd (default, stdio, Pterodactyl-safe),
                     xterm, none. Env: UML_CONSOLE.
-  --init PATH       Guest init binary (default: /lib/systemd/systemd).
-                    Env: UML_INIT (flag wins), config `init:`.
+  --init PATH       Guest init binary.
+                    --init flag > UML_INIT env > config `init:` > auto-detect
+                    from the image > /lib/systemd/systemd.
                     Rescue/debug: --init /bin/sh (skips systemd entirely).
   --mode MODE       Userspace mode: seccomp (default, skas0 on Android),
                     skas0, auto.
@@ -738,6 +739,28 @@ yaml_val() {
   grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"' || true
 }
 
+# Auto-detect the guest init binary so non-systemd images (e.g. Alpine with
+# OpenRC, /sbin/init) boot without manual --init. Probes well-known paths
+# inside the ext4 rootfs with debugfs (read-only, no root/mount needed);
+# falls back to a distro-name heuristic when debugfs is unavailable.
+# Prints the path, or nothing (caller keeps its default).
+detect_guest_init() { # detect_guest_init IMG [IMAGE_NAME]
+  local img="$1" iname="${2:-}" cand out
+  case "$iname" in
+    *alpine*) echo "/sbin/init"; return 0 ;;
+  esac
+  if command -v debugfs >/dev/null 2>&1 && [ -f "$img" ]; then
+    for cand in /lib/systemd/systemd /usr/lib/systemd/systemd /sbin/init /bin/sh; do
+      out="$(debugfs -R "stat $cand" "$img" 2>/dev/null)" || out=""
+      case "$out" in
+        *"File not found"*) ;;
+        *"Inode:"*) echo "$cand"; return 0 ;;
+      esac
+    done
+  fi
+  return 1
+}
+
 # Remember the userspace mode pick in config.yaml so later boots
 # (incl. startuml.sh) reuse it without asking again.
 persist_config_mode() {
@@ -765,8 +788,12 @@ do_boot() {
     ''|*[!0-9]*) ncpus=1 ;;
   esac
   [ "$ncpus" -lt 1 ] && ncpus=1
-  # Guest init: --init flag > UML_INIT env > config `init:` > systemd.
+  # Guest init: --init flag > UML_INIT env > config `init:` > auto-detect
+  # from the image (systemd, Alpine /sbin/init, ...) > historic default.
   local init_bin="${UML_INIT_ARG:-${UML_INIT:-$(yaml_val init)}}"
+  if [ -z "$init_bin" ]; then
+    init_bin="$(detect_guest_init "$ROOTFS" "$(manifest_val image)" || true)"
+  fi
   init_bin="${init_bin:-/lib/systemd/systemd}"
 
   for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do

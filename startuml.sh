@@ -108,6 +108,30 @@ yaml_val() {
     # Always succeeds (empty when absent): callers run under `set -e`.
     grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"' || true
 }
+manifest_val() { # manifest_val KEY (empty when absent; always succeeds)
+    grep -E "^${1}=" "$DATA_DIR/.uml_manifest" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+# Auto-detect the guest init binary so non-systemd images (e.g. Alpine with
+# OpenRC, /sbin/init) boot without manual --init. Probes well-known paths
+# inside the ext4 rootfs with debugfs (read-only, no root/mount needed);
+# falls back to a distro-name heuristic when debugfs is unavailable.
+detect_guest_init() { # detect_guest_init IMG [IMAGE_NAME]
+    local img="$1" iname="${2:-}" cand out
+    case "$iname" in
+        *alpine*) echo "/sbin/init"; return 0 ;;
+    esac
+    if command -v debugfs >/dev/null 2>&1 && [ -f "$img" ]; then
+        for cand in /lib/systemd/systemd /usr/lib/systemd/systemd /sbin/init /bin/sh; do
+            out="$(debugfs -R "stat $cand" "$img" 2>/dev/null)" || out=""
+            case "$out" in
+                *"File not found"*) ;;
+                *"Inode:"*) echo "$cand"; return 0 ;;
+            esac
+        done
+    fi
+    return 1
+}
 
 # Userspace mode resolution order: UML_MODE env > config.yaml > default
 # (skas0 on Android, seccomp elsewhere). run.sh --reinstall saves the
@@ -130,8 +154,13 @@ if [ -z "${UML_MODE:-}" ]; then
     if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
   fi
 fi
-# Guest init: --init flag > UML_INIT env > config `init:` > systemd.
+# Guest init: --init flag > UML_INIT env > config `init:` > auto-detect
+# from the image (systemd, Alpine /sbin/init, ...) > historic default.
 INIT_BIN="${UML_INIT_ARG:-${UML_INIT:-$(yaml_val init)}}"
+if [ -z "$INIT_BIN" ]; then
+  _detected="$(detect_guest_init "$ROOTFS" "$(manifest_val image)" || true)"
+  [ -n "$_detected" ] && INIT_BIN="$_detected"
+fi
 INIT_BIN="${INIT_BIN:-/lib/systemd/systemd}"
 
 for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
