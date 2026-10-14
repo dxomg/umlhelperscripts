@@ -54,14 +54,17 @@ REPO="dxomg/uml-kernel-build"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
 apply_arch() {
+  SLIRP_ASSET=""; STUB_ASSET=""
   case "$1" in
     x86_64|amd64)
       ARCH_LABEL="x86_64"; IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64" ;;
     arm64|aarch64)
       ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"
-      # Android arm64 cannot exec glibc binaries: use static bionic assets.
+      # Android arm64 cannot exec glibc binaries: use the static bionic set
+      # (linux-bionic + vde_plug_bionic + slirp_bionic + stub_exe_bionic).
       if is_android; then
-        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug-android-arm64"
+        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug_bionic"
+        SLIRP_ASSET="slirp_bionic"; STUB_ASSET="stub_exe_bionic"
       fi
       ;;
     *) echo "Invalid --arch: $1 (use x86_64|arm64)" >&2; return 1 ;;
@@ -263,9 +266,20 @@ fi
 echo "==> Downloading latest UML kernel and networking tools..."
 download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux"
 download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug"
-# NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
-# networking is provided via vde_plug, so no slirp download needed.
-rm -f "$DATA_DIR/slirp" ./slirp
+if [ -n "${SLIRP_ASSET:-}" ]; then
+  echo "==> Downloading helper ${SLIRP_ASSET}..."
+  download "${BASE_URL}/${SLIRP_ASSET}" "$DATA_DIR/slirp"
+else
+  # NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
+  # networking is provided via vde_plug, so no slirp download needed.
+  rm -f "$DATA_DIR/slirp" ./slirp
+fi
+if [ -n "${STUB_ASSET:-}" ]; then
+  echo "==> Downloading stub ${STUB_ASSET}..."
+  download "${BASE_URL}/${STUB_ASSET}" "$DATA_DIR/stub_exe_bionic"
+  ln -sf stub_exe_bionic "$DATA_DIR/stub_exe" 2>/dev/null \
+    || cp -f "$DATA_DIR/stub_exe_bionic" "$DATA_DIR/stub_exe" 2>/dev/null || true
+fi
 
 echo "==> Downloading rootfs image ${IMAGE_GZ}..."
 download "${BASE_URL}/${IMAGE_GZ}" "$DATA_DIR/rootfs.img.gz"
@@ -285,7 +299,11 @@ fi
 
 echo "==> Setting executable permissions..."
 chmod +x "$DATA_DIR/linux" "$DATA_DIR/vde_plug" "$BASE/startuml.sh" "$BASE/resizeimg.sh" 2>/dev/null || true
-[ -f "$DATA_DIR/slirp" ] && chmod +x "$DATA_DIR/slirp" || true
+[ -f "$DATA_DIR/slirp" ] && chmod +x "$DATA_DIR/slirp" 2>/dev/null || true
+if [ -f "$DATA_DIR/stub_exe_bionic" ]; then
+  chmod +x "$DATA_DIR/stub_exe_bionic" 2>/dev/null || true
+  [ -f "$DATA_DIR/stub_exe" ] && chmod +x "$DATA_DIR/stub_exe" 2>/dev/null || true
+fi
 
 echo "==> Extracting rootfs image to base.img..."
 gunzip -f "$DATA_DIR/rootfs.img.gz"
@@ -335,6 +353,17 @@ echo ""
 echo "Installed:"
 echo "  - kernel : ${KERNEL_ASSET} -> $DATA_DIR/linux"
 echo "  - image  : ${IMAGE_GZ} -> $DATA_DIR/base.img"
+if [ -n "${SLIRP_ASSET:-}${STUB_ASSET:-}" ]; then
+  echo "  - helpers: ${VDE_ASSET}, ${SLIRP_ASSET:-none}, ${STUB_ASSET:-none}"
+fi
+{
+  echo "kernel=${KERNEL_ASSET}"
+  echo "vde=${VDE_ASSET}"
+  echo "slirp=${SLIRP_ASSET:-none}"
+  echo "stub=${STUB_ASSET:-none}"
+  echo "image=${IMAGE_GZ}"
+  echo "arch=${ARCH_LABEL}"
+} > "$DATA_DIR/.uml_manifest" 2>/dev/null || true
 echo ""
 echo "Next steps:"
 echo "  - (Optional) Resize your image: ./resizeimg.sh \"$DATA_DIR/base.img\" <SIZE>"

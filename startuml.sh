@@ -133,6 +133,20 @@ fi
 for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
     if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f (run ./run.sh --reinstall or ./install.sh first)"; exit 1; fi
 done
+# Android needs the extra bionic helpers beside the kernel (non-fatal here:
+# run.sh fetches them automatically at boot; install.sh at install).
+if is_android; then
+    for _h in "$DATA_DIR/slirp" "$DATA_DIR/stub_exe_bionic"; do
+        if [ ! -f "$_h" ]; then
+            echo "[!] Android helper missing: $_h" >&2
+            echo "    Refresh with: ./run.sh (auto-fetches bionic helpers) or ./install.sh" >&2
+        fi
+    done
+    if [ ! -f "$DATA_DIR/stub_exe" ] && [ -f "$DATA_DIR/stub_exe_bionic" ]; then
+        ln -sf stub_exe_bionic "$DATA_DIR/stub_exe" 2>/dev/null \
+            || cp -f "$DATA_DIR/stub_exe_bionic" "$DATA_DIR/stub_exe" 2>/dev/null || true
+    fi
+fi
 if [ ! -x "$DATA_DIR/vde_plug" ]; then chmod +x "$DATA_DIR/vde_plug"; fi
 chmod +x "$KERNEL" 2>/dev/null || true
 if [ ! -x "$KERNEL" ]; then

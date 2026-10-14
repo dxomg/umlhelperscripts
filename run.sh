@@ -84,8 +84,10 @@ HELPER_URL="https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/
 # --- Architecture detection (override: --arch / UML_ARCH) ---
 # Normalises: x86_64/amd64 -> x86_64, aarch64/arm64 -> arm64.
 # On Android arm64 the glibc assets cannot exec (no /lib/ld-linux); use the
-# statically-linked bionic kernel + Android vde_plug instead (verified:
-# linux-bionic = AArch64 static/NDK, vde_plug-android-arm64 = linker64).
+# statically-linked bionic set instead (verified AArch64/NDK-static):
+# linux-bionic + vde_plug_bionic (C vde_plug with built-in libvdeslirp, so it
+# understands vnl=slirp://) + slirp_bionic (standalone helper) +
+# stub_exe_bionic (UML stub process image, kept beside the kernel).
 is_android() {
   [ -n "${PREFIX:-}" ] && case "$PREFIX" in *com.termux*) return 0 ;; esac
   [ -d "/system/app" ] && [ ! -d "/usr/bin" ] && return 0
@@ -94,6 +96,7 @@ is_android() {
   return 1
 }
 apply_arch() {
+  SLIRP_ASSET=""; STUB_ASSET=""
   case "$1" in
     x86_64|amd64)
       ARCH_LABEL="x86_64"; IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64"
@@ -103,7 +106,8 @@ apply_arch() {
       ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"
       LIB_TRIPLET="aarch64-linux-gnu"
       if is_android; then
-        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug-android-arm64"
+        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug_bionic"
+        SLIRP_ASSET="slirp_bionic"; STUB_ASSET="stub_exe_bionic"
       fi
       ;;
     *)
@@ -333,6 +337,13 @@ need_install() {
   [ ! -f "$DATA_DIR/vde_plug" ] && return 0
   [ ! -f "$ROOTFS" ] && return 0
   [ ! -f "$CONFIG" ] && return 0
+  # Rootfs/arch drift (e.g. --arch switch after install): full reinstall so
+  # the guest userspace matches the kernel. Helper-only drift is handled by
+  # refresh_android_helpers() at boot without re-downloading base.img.
+  local _exp _have
+  _exp="$(resolve_image "${WANT_IMAGE:-$DEFAULT_DISTRO}")" || return 0
+  _have="$(manifest_val image)"
+  if [ -n "$_have" ] && [ "$_have" != "$_exp" ]; then return 0; fi
   return 1
 }
 
@@ -441,12 +452,14 @@ preflight_kernel() { # preflight_kernel KERNEL_FILE
       echo "[ERROR] Cannot execute $k (exit $rc: missing loader or noexec mount)." >&2
       if is_android; then
         echo "        This is Android (bionic): the glibc UML kernel cannot run here." >&2
-        echo "        You likely have a stale glibc 'linux' - re-run with the bionic assets:" >&2
-        echo "          ./run.sh --reinstall   (auto-picks linux-bionic on Android/arm64)" >&2
-        echo "        Or manual swap:" >&2
+        echo "        You likely have stale glibc helpers - refresh them:" >&2
+        echo "          ./run.sh --reinstall   (auto-picks linux-bionic + bionic helpers on Android/arm64)" >&2
+        echo "        Or manual swap (all four Android assets):" >&2
         echo "          curl -fSL -o linux https://github.com/${REPO}/releases/latest/download/linux-bionic" >&2
-        echo "          curl -fSL -o vde_plug https://github.com/${REPO}/releases/latest/download/vde_plug-android-arm64" >&2
-        echo "          chmod +x linux vde_plug" >&2
+        echo "          curl -fSL -o vde_plug https://github.com/${REPO}/releases/latest/download/vde_plug_bionic" >&2
+        echo "          curl -fSL -o slirp https://github.com/${REPO}/releases/latest/download/slirp_bionic" >&2
+        echo "          curl -fSL -o stub_exe_bionic https://github.com/${REPO}/releases/latest/download/stub_exe_bionic" >&2
+        echo "          ln -sf stub_exe_bionic stub_exe && chmod +x linux vde_plug slirp stub_exe_bionic" >&2
         echo "        Fallback: run inside a glibc proot distro (proot-distro login debian)." >&2
       elif [ ! -f "/lib/ld-linux-aarch64.so.1" ] && [ ! -f "/lib64/ld-linux-x86-64.so.2" ] && [ ! -f "/lib/ld-linux-x86-64.so.2" ]; then
         echo "        No glibc loader found - musl/Alpine or minimal rootfs?" >&2
@@ -457,6 +470,113 @@ preflight_kernel() { # preflight_kernel KERNEL_FILE
     return 1
   fi
   # Any other exit code (e.g. UML prints usage with rc!=0) is fine.
+  return 0
+}
+
+# Download kernel + userspace helpers for the current arch mapping.
+# Android additionally fetches slirp_bionic + stub_exe_bionic.
+download_helpers() {
+  download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux" || return 1
+  download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug" || return 1
+  if [ -n "${SLIRP_ASSET:-}" ]; then
+    echo "==> Downloading helper ${SLIRP_ASSET}..."
+    download "${BASE_URL}/${SLIRP_ASSET}" "$DATA_DIR/slirp" || return 1
+  else
+    # Upstream glibc releases dropped standalone slirp (v2026.09.26-18+);
+    # networking there is provided via vde_plug, so remove stale copies.
+    rm -f "$DATA_DIR/slirp" "$BASE/slirp"
+  fi
+  if [ -n "${STUB_ASSET:-}" ]; then
+    echo "==> Downloading stub ${STUB_ASSET}..."
+    download "${BASE_URL}/${STUB_ASSET}" "$DATA_DIR/stub_exe_bionic" || return 1
+    # The kernel looks for the stub beside itself; provide both the release
+    # asset name and the canonical short name.
+    ln -sf stub_exe_bionic "$DATA_DIR/stub_exe" 2>/dev/null \
+      || cp -f "$DATA_DIR/stub_exe_bionic" "$DATA_DIR/stub_exe" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Verify downloads: GitHub error pages are tiny HTML, real assets are MBs.
+verify_helpers() {
+  local _f
+  for _f in "$DATA_DIR/linux" "$DATA_DIR/vde_plug"; do
+    if [ ! -s "$_f" ]; then
+      echo "[ERROR] Download failed/empty: $_f (check network + asset ${KERNEL_ASSET}/${VDE_ASSET})" >&2
+      return 1
+    fi
+  done
+  if [ -n "${SLIRP_ASSET:-}" ] && [ ! -s "$DATA_DIR/slirp" ]; then
+    echo "[ERROR] Download failed/empty: $DATA_DIR/slirp (asset ${SLIRP_ASSET})" >&2
+    return 1
+  fi
+  if [ -n "${STUB_ASSET:-}" ] && [ ! -s "$DATA_DIR/stub_exe_bionic" ]; then
+    echo "[ERROR] Download failed/empty: $DATA_DIR/stub_exe_bionic (asset ${STUB_ASSET})" >&2
+    return 1
+  fi
+  if head -c 15 "$DATA_DIR/linux" 2>/dev/null | grep -q '<'; then
+    echo "[ERROR] Kernel download looks like an HTML error page, not a binary." >&2
+    echo "        Check https://github.com/${REPO}/releases for ${KERNEL_ASSET}." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Track which release assets an install came from, so helper-only drift
+# (e.g. Android mapping changes) refreshes helpers without re-downloading
+# the ~175MB rootfs.
+manifest_path() { echo "$DATA_DIR/.uml_manifest"; }
+write_manifest() { # write_manifest IMAGE_GZ
+  {
+    echo "kernel=${KERNEL_ASSET}"
+    echo "vde=${VDE_ASSET}"
+    echo "slirp=${SLIRP_ASSET:-none}"
+    echo "stub=${STUB_ASSET:-none}"
+    echo "image=${1:-}"
+    echo "arch=${ARCH_LABEL}"
+  } > "$(manifest_path)" 2>/dev/null || true
+}
+manifest_val() { # manifest_val KEY (empty when absent; always succeeds)
+  grep -E "^${1}=" "$(manifest_path)" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+# Refresh helpers when the mapping drifted (or Android extras are missing),
+# without touching base.img. Best effort: on download failure the existing
+# files are kept and boot proceeds to preflight.
+refresh_android_helpers() {
+  [ -n "${SLIRP_ASSET:-}${STUB_ASSET:-}" ] || return 0
+  local did=0
+  if [ ! -s "$DATA_DIR/linux" ] || [ "$(manifest_val kernel)" != "$KERNEL_ASSET" ]; then
+    echo "==> Refreshing kernel ${KERNEL_ASSET}..."
+    download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux" || return 1
+    did=1
+  fi
+  if [ ! -s "$DATA_DIR/vde_plug" ] || [ "$(manifest_val vde)" != "$VDE_ASSET" ]; then
+    echo "==> Refreshing helper ${VDE_ASSET}..."
+    download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug" || return 1
+    did=1
+  fi
+  if [ -n "${SLIRP_ASSET:-}" ] && { [ ! -s "$DATA_DIR/slirp" ] || [ "$(manifest_val slirp)" != "$SLIRP_ASSET" ]; }; then
+    echo "==> Refreshing helper ${SLIRP_ASSET}..."
+    download "${BASE_URL}/${SLIRP_ASSET}" "$DATA_DIR/slirp" || return 1
+    did=1
+  fi
+  if [ -n "${STUB_ASSET:-}" ] && { [ ! -s "$DATA_DIR/stub_exe_bionic" ] || [ "$(manifest_val stub)" != "$STUB_ASSET" ]; }; then
+    echo "==> Refreshing stub ${STUB_ASSET}..."
+    download "${BASE_URL}/${STUB_ASSET}" "$DATA_DIR/stub_exe_bionic" || return 1
+    did=1
+  fi
+  [ "$did" -eq 0 ] && return 0
+  ln -sf stub_exe_bionic "$DATA_DIR/stub_exe" 2>/dev/null \
+    || cp -f "$DATA_DIR/stub_exe_bionic" "$DATA_DIR/stub_exe" 2>/dev/null || true
+  verify_helpers || return 1
+  chmod +x "$DATA_DIR/linux" "$DATA_DIR/vde_plug" 2>/dev/null || true
+  [ -f "$DATA_DIR/slirp" ] && chmod +x "$DATA_DIR/slirp" 2>/dev/null || true
+  if [ -f "$DATA_DIR/stub_exe_bionic" ]; then
+    chmod +x "$DATA_DIR/stub_exe_bionic" 2>/dev/null || true
+    [ -f "$DATA_DIR/stub_exe" ] && chmod +x "$DATA_DIR/stub_exe" 2>/dev/null || true
+  fi
+  write_manifest "$(manifest_val image)"
   return 0
 }
 
@@ -481,23 +601,8 @@ do_install() {
   echo ""
   ensure_host_deps || exit 1
   echo "==> Downloading UML kernel and networking tools..."
-  download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux"
-  download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug"
-  # Verify downloads: GitHub error pages are tiny HTML, real assets are MBs.
-  for _f in "$DATA_DIR/linux" "$DATA_DIR/vde_plug"; do
-    if [ ! -s "$_f" ]; then
-      echo "[ERROR] Download failed/empty: $_f (check network + asset ${KERNEL_ASSET}/${VDE_ASSET})" >&2
-      return 1
-    fi
-  done
-  if head -c 15 "$DATA_DIR/linux" 2>/dev/null | grep -q '<'; then
-    echo "[ERROR] Kernel download looks like an HTML error page, not a binary." >&2
-    echo "        Check https://github.com/${REPO}/releases for ${KERNEL_ASSET}." >&2
-    return 1
-  fi
-  # NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
-  # networking is provided via vde_plug, so no slirp download needed.
-  rm -f "$DATA_DIR/slirp" "$BASE/slirp"
+  download_helpers || return 1
+  verify_helpers || return 1
 
   echo "==> Downloading rootfs image ${image_gz}..."
   download "${BASE_URL}/${image_gz}" "$DATA_DIR/rootfs.img.gz"
@@ -514,6 +619,10 @@ do_install() {
   echo "==> Setting executable permissions..."
   chmod +x "$DATA_DIR/linux" "$DATA_DIR/vde_plug"
   [ -f "$DATA_DIR/slirp" ] && chmod +x "$DATA_DIR/slirp" || true
+  if [ -f "$DATA_DIR/stub_exe_bionic" ]; then
+    chmod +x "$DATA_DIR/stub_exe_bionic" 2>/dev/null || true
+    [ -f "$DATA_DIR/stub_exe" ] && chmod +x "$DATA_DIR/stub_exe" 2>/dev/null || true
+  fi
 
   echo "==> Extracting rootfs image to base.img..."
   gunzip -f "$DATA_DIR/rootfs.img.gz"
@@ -583,8 +692,12 @@ do_install() {
   if [ -n "${UML_MODE:-}" ]; then
     persist_config_mode "$UML_MODE" && echo "==> Userspace mode '$UML_MODE' saved to $CONFIG"
   fi
+  write_manifest "$image_gz"
 
   echo "==> Install complete: kernel=${KERNEL_ASSET}, image=${image_gz} -> base.img"
+  if [ -n "${SLIRP_ASSET:-}${STUB_ASSET:-}" ]; then
+    echo "    helpers: ${VDE_ASSET}, ${SLIRP_ASSET:-none}, ${STUB_ASSET:-none}"
+  fi
   echo ""
 }
 
@@ -626,6 +739,11 @@ do_boot() {
   done
   if [ ! -x "$DATA_DIR/vde_plug" ]; then chmod +x "$DATA_DIR/vde_plug"; fi
   if [ ! -x "$KERNEL" ]; then chmod +x "$KERNEL"; fi
+
+  # Helper drift (e.g. Android mapping gained slirp/stub after install):
+  # fetch just the helpers, keep base.img. Best effort - boot proceeds
+  # with existing files if the refresh fails.
+  refresh_android_helpers || echo "[!] Helper refresh failed; continuing with existing files." >&2
 
   # Fail fast with a clear message instead of cryptic exec errors
   # (Android/bionic, noexec mounts, truncated downloads).
