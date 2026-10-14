@@ -1,29 +1,56 @@
 #!/bin/bash
+# install.sh - install-only. Works on Pterodactyl AND standard Linux.
+# For one-step install+boot, use run.sh instead.
 set -euo pipefail
+
+BASE="$(cd "$(dirname "$0")" && pwd)"
+DATA_DIR="${UML_DATA_DIR:-$BASE}"
 
 REPO="dxomg/uml-kernel-build"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
-# Detect host arch -> release asset suffix
-UNAME_M="$(uname -m 2>/dev/null || echo x86_64)"
+apply_arch() {
+  case "$1" in
+    x86_64|amd64)
+      ARCH_LABEL="x86_64"; IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64" ;;
+    arm64|aarch64)
+      ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64" ;;
+    *) echo "Invalid --arch: $1 (use x86_64|arm64)" >&2; return 1 ;;
+  esac
+  UNAME_M="$1"
+}
+UNAME_M="${UML_ARCH:-$(uname -m 2>/dev/null || echo x86_64)}"
 case "$UNAME_M" in
-  x86_64|amd64)
-    ARCH_LABEL="x86_64"
-    IMG_SUFFIX=""        # e.g. base-debian-trixie.img.gz
-    KERNEL_ASSET="linux-uml"
-    VDE_ASSET="vde_plug-x86_64"
-    ;;
-  aarch64|arm64)
-    ARCH_LABEL="arm64"
-    IMG_SUFFIX="-arm64"  # e.g. base-debian-trixie-arm64.img.gz
-    KERNEL_ASSET="linux-uml-arm64"
-    VDE_ASSET="vde_plug-arm64"
-    ;;
-  *)
-    echo "Unsupported architecture: $UNAME_M (expected x86_64 or aarch64)" >&2
-    exit 1
-    ;;
+  amd64) UNAME_M="x86_64" ;;
+  aarch64) UNAME_M="arm64" ;;
 esac
+apply_arch "$UNAME_M" || exit 1
+
+detect_env() {
+  case "${UML_ENV:-auto}" in
+    pterodactyl|standard) echo "${UML_ENV}"; return 0 ;;
+  esac
+  if [ -n "${PTERODACTYL:-}" ] || [ -n "${SERVER_MEMORY:-}" ]; then echo "pterodactyl"; return 0; fi
+  case "$BASE$DATA_DIR" in
+    */home/container*) echo "pterodactyl"; return 0 ;;
+  esac
+  echo "standard"
+}
+ENV_KIND="$(detect_env)"
+
+download() { # download URL DEST-or-blank(for cwd file)
+  local url="$1" dest="${2:-}"
+  if command -v wget >/dev/null 2>&1; then
+    if [ -n "$dest" ]; then wget -q --show-progress -O "$dest" "$url"
+    else wget -q --show-progress "$url"; fi
+  elif command -v curl >/dev/null 2>&1; then
+    if [ -n "$dest" ]; then curl -fSL --progress-bar -o "$dest" "$url"
+    else curl -fSL -O "$url"; fi
+  else
+    echo "[ERROR] Need wget or curl to download $url" >&2
+    return 1
+  fi
+}
 
 # Distros available in the latest release (must match uml-kernel-build assets)
 DISTROS=(
@@ -57,7 +84,10 @@ Usage: $0 [OPTIONS] [IMAGE|NUMBER]
 
 Options:
   -l, --list        List available images and exit
-  -a, --arch ARCH   Override arch: x86_64 | arm64 (default: auto-detected ${ARCH_LABEL})
+  -a, --arch ARCH   Override arch: x86_64 | arm64 (default: auto-detected ${ARCH_LABEL}).
+                    Env: UML_ARCH.
+  --env ENV         Override env: auto (default), pterodactyl, standard. Env: UML_ENV.
+  --data-dir DIR    Install into DIR instead of script dir. Env: UML_DATA_DIR.
   -h, --help        Show this help
 
 IMAGE can be:
@@ -71,22 +101,24 @@ Examples:
   $0 debian-trixie
   $0 1
   $0 base-ubuntu-noble${IMG_SUFFIX}.img.gz
+  $0 --arch arm64 --data-dir ~/.local/share/uml debian-trixie
 EOF
 }
 
 # --- parse args ---
 ACTION="install"
-WANT=""
+WANT="${UML_IMAGE:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -l|--list) ACTION="list"; shift ;;
     -a|--arch)
-      case "${2:-}" in
-        x86_64|amd64) IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64"; ARCH_LABEL="x86_64" ;;
-        arm64|aarch64) IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"; ARCH_LABEL="arm64" ;;
-        *) echo "Invalid --arch: $2 (use x86_64|arm64)" >&2; exit 1 ;;
-      esac
+      apply_arch "${2:-}" || exit 1
       shift 2 ;;
+    --arch=*) apply_arch "${1#--arch=}" || exit 1; shift ;;
+    --env) UML_ENV="${2:-auto}"; ENV_KIND="$(detect_env)"; shift 2 ;;
+    --env=*) UML_ENV="${1#--env=}"; ENV_KIND="$(detect_env)"; shift ;;
+    --data-dir) DATA_DIR="$2"; shift 2 ;;
+    --data-dir=*) DATA_DIR="${1#--data-dir=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     *) WANT="$1"; shift ;;
@@ -145,38 +177,56 @@ fi
 
 IMAGE_GZ="$(resolve_image "$WANT")"
 
-echo "==> Architecture: ${UNAME_M} -> ${ARCH_LABEL}"
+mkdir -p "$DATA_DIR" || { echo "[ERROR] Data dir not writable: $DATA_DIR" >&2; exit 1; }
+cd "$DATA_DIR"
+
+echo "==> Architecture: ${UNAME_M} -> ${ARCH_LABEL} (env: ${ENV_KIND})"
+echo "==> Data dir: ${DATA_DIR}"
 echo "==> Image: ${IMAGE_GZ}"
 echo ""
+if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+  echo "[ERROR] Need wget or curl." >&2
+  [ "$ENV_KIND" = "standard" ] && echo "  Fix (Debian/Ubuntu): sudo apt-get install -y wget" >&2
+  exit 1
+fi
 echo "==> Downloading latest UML kernel and networking tools..."
-wget -q --show-progress -O linux "${BASE_URL}/${KERNEL_ASSET}"
-wget -q --show-progress -O vde_plug "${BASE_URL}/${VDE_ASSET}"
+download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux"
+download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug"
 # NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
 # networking is provided via vde_plug, so no slirp download needed.
-rm -f slirp
+rm -f "$DATA_DIR/slirp" ./slirp
 
 echo "==> Downloading rootfs image ${IMAGE_GZ}..."
-wget -q --show-progress -O rootfs.img.gz "${BASE_URL}/${IMAGE_GZ}"
+download "${BASE_URL}/${IMAGE_GZ}" "$DATA_DIR/rootfs.img.gz"
 
 echo "==> Downloading helper scripts and configuration..."
-wget -q --show-progress https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/startuml.sh
-wget -q --show-progress https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/resizeimg.sh
-wget -q --show-progress https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/config.yaml
+# Keep helpers next to the install script (repo dir), not DATA_DIR, so a
+# custom --data-dir still leaves launchers where the user expects them.
+download https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/startuml.sh "$BASE/startuml.sh" || true
+download https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/resizeimg.sh "$BASE/resizeimg.sh" || true
+if [ "$DATA_DIR" = "$BASE" ]; then
+  download https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/config.yaml "$DATA_DIR/config.yaml" || true
+elif [ ! -f "$DATA_DIR/config.yaml" ]; then
+  if [ -f "$BASE/config.yaml" ]; then cp "$BASE/config.yaml" "$DATA_DIR/config.yaml"
+  else download https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/main/config.yaml "$DATA_DIR/config.yaml" || true
+  fi
+fi
 
 echo "==> Setting executable permissions..."
-chmod +x linux vde_plug startuml.sh resizeimg.sh
-[ -f slirp ] && chmod +x slirp || true
+chmod +x "$DATA_DIR/linux" "$DATA_DIR/vde_plug" "$BASE/startuml.sh" "$BASE/resizeimg.sh" 2>/dev/null || true
+[ -f "$DATA_DIR/slirp" ] && chmod +x "$DATA_DIR/slirp" || true
 
 echo "==> Extracting rootfs image to base.img..."
-gunzip -f rootfs.img.gz
-mv -f rootfs.img base.img
+gunzip -f "$DATA_DIR/rootfs.img.gz"
+mv -f "$DATA_DIR/rootfs.img" "$DATA_DIR/base.img"
 
 echo "==> Setup complete!"
 echo ""
 echo "Installed:"
-echo "  - kernel : ${KERNEL_ASSET} -> linux"
-echo "  - image  : ${IMAGE_GZ} -> base.img"
+echo "  - kernel : ${KERNEL_ASSET} -> $DATA_DIR/linux"
+echo "  - image  : ${IMAGE_GZ} -> $DATA_DIR/base.img"
 echo ""
 echo "Next steps:"
-echo "  - (Optional) Resize your image: ./resizeimg.sh base.img <SIZE>"
+echo "  - (Optional) Resize your image: ./resizeimg.sh \"$DATA_DIR/base.img\" <SIZE>"
 echo "  - Start the UML environment:   ./startuml.sh"
+echo "    (standard host with custom dir: UML_DATA_DIR=\"$DATA_DIR\" ./startuml.sh)"

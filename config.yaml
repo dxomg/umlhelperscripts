@@ -3,6 +3,9 @@
 #
 # IPv4: guest 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3
 # IPv6: guest fec0::15/64, gateway fec0::2, DNS fec0::3
+#
+# Read by run.sh / startuml.sh (memory, ncpus). All other keys are
+# documented wishes / guest-side hints - see below.
 
 memory: 2G
 # Number of vCPUs for the guest (UML SMP). Requires a kernel built with
@@ -14,7 +17,18 @@ ipv4: true
 ipv6: true
 
 # Port forwarding: "hostport:guestport" or "udp hostport:guestport"
+# NOTE: informational for now - the launchers do not auto-wire slirp
+# port-forwards yet. Handled inside the guest / via host firewall.
 portfwd: true
 ports:
   - "2222:22"          # SSH
   - "8006:8006"
+
+# --- Launcher behaviour (all optional, env vars win over these) ---
+# Uncomment to pin instead of passing flags / env:
+# env: auto             # auto | pterodactyl | standard
+# arch: auto            # auto | x86_64 | arm64
+# console: fd           # fd | xterm | none
+# mode: seccomp         # seccomp | skas0 | auto
+# data_dir: ""          # e.g. ~/.local/share/uml (empty = script dir)
+# tmp_dir: ""           # empty = auto (.uml_tmp on Pterodactyl, /tmp on standard)
