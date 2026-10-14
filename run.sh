@@ -7,7 +7,49 @@
 # Based from LNQuang
 set -euo pipefail
 
-BASE="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the repo dir robustly, including `curl ... | bash` (where $0 is
+# "bash"/"sh" and has no file) and shells where getcwd() fails (deleted cwd,
+# Android/bionic ERANGE). Result is validated absolute before use.
+resolve_base() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  case "$src" in
+    bash|sh|dash|*busybox*|"") src="" ;;
+  esac
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    local dd name d
+    dd="$(dirname "$src")"; name="$(basename "$src")"
+    d="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    d="$(cd "$dd" 2>/dev/null && pwd 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    # getcwd() broken but dir reachable by fd: cd there (subshell) and trust
+    # the shell's logically-tracked $PWD, verified via absolute -d probe.
+    if cd "$dd" 2>/dev/null && [ -f "$name" ]; then
+      case "${PWD:-}" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac
+    fi
+  fi
+  # Piped / stdin mode (or unresolvable file mode): fall back to a usable cwd.
+  local d
+  d="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "${PWD:-}")"
+  if [ -n "$d" ]; then case "$d" in /*) [ -d "$d" ] && { echo "$d"; return 0; } ;; esac; fi
+  if [ -n "${PWD:-}" ]; then case "$PWD" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac; fi
+  echo "/tmp"
+}
+BASE="$(resolve_base)"
+# getcwd() may fail while the directory itself is fine (deleted cwd,
+# Android/bionic ERANGE). Re-anchor via absolute cd; only abort if the
+# directory is genuinely unusable.
+if ! pwd >/dev/null 2>&1; then
+  if [ -d "$BASE" ] && cd "$BASE" 2>/dev/null && mkdir -p "$BASE" 2>/dev/null; then
+    echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
+    echo "    anchored to $BASE, continuing with absolute paths." >&2
+  else
+    echo "[ERROR] Current directory is inaccessible and '$BASE' is unusable." >&2
+    echo "        cd to a real, writable directory first, e.g.:" >&2
+    echo "          mkdir -p /data/adb/uml && cd /data/adb/uml" >&2
+    exit 1
+  fi
+fi
 # Allow regular-env users to keep data outside the repo checkout:
 #   UML_DATA_DIR=~/.local/share/uml ./run.sh
 DATA_DIR="${UML_DATA_DIR:-$BASE}"
@@ -27,6 +69,16 @@ HELPER_URL="https://raw.githubusercontent.com/dxomg/umlhelperscripts/refs/heads/
 
 # --- Architecture detection (override: --arch / UML_ARCH) ---
 # Normalises: x86_64/amd64 -> x86_64, aarch64/arm64 -> arm64.
+# On Android arm64 the glibc assets cannot exec (no /lib/ld-linux); use the
+# statically-linked bionic kernel + Android vde_plug instead (verified:
+# linux-bionic = AArch64 static/NDK, vde_plug-android-arm64 = linker64).
+is_android() {
+  [ -n "${PREFIX:-}" ] && case "$PREFIX" in *com.termux*) return 0 ;; esac
+  [ -d "/system/app" ] && [ ! -d "/usr/bin" ] && return 0
+  [ -f "/system/build.prop" ] && ! command -v dpkg >/dev/null 2>&1 && return 0
+  [ "$(uname -o 2>/dev/null)" = "Android" ] && return 0
+  return 1
+}
 apply_arch() {
   case "$1" in
     x86_64|amd64)
@@ -36,6 +88,9 @@ apply_arch() {
     arm64|aarch64)
       ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"
       LIB_TRIPLET="aarch64-linux-gnu"
+      if is_android; then
+        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug-android-arm64"
+      fi
       ;;
     *)
       echo "Unsupported architecture: $1 (expected x86_64 or aarch64; override with --arch x86_64|arm64)" >&2
@@ -310,8 +365,9 @@ setup_tmpdir() {
   if [ "$ENV_KIND" = "pterodactyl" ]; then
     mkdir -p "$DATA_DIR/.uml_tmp" && echo "$DATA_DIR/.uml_tmp" && return 0
   fi
-  local cand
-  for cand in "${XDG_RUNTIME_DIR:-}/uml-tmp" "/tmp/uml-$USER" "$DATA_DIR/.uml_tmp"; do
+  local cand _user
+  _user="${USER:-$(id -un 2>/dev/null || echo host)}"
+  for cand in "${XDG_RUNTIME_DIR:-}/uml-tmp" "/tmp/uml-$_user" "$DATA_DIR/.uml_tmp"; do
     [ -n "$cand" ] && [ "$cand" != "/uml-tmp" ] || continue
     if mkdir -p "$cand" 2>/dev/null; then
       local t; t=$(mktemp "$cand/.exec_XXXXXX" 2>/dev/null) || continue
@@ -321,6 +377,54 @@ setup_tmpdir() {
     fi
   done
   mkdir -p "$DATA_DIR/.uml_tmp" && echo "$DATA_DIR/.uml_tmp"
+}
+
+# Pre-boot sanity: ELF magic, exec bit, and (best effort) that the kernel
+# actually starts. Turns cryptic `No such file or directory` (missing glibc
+# loader / noexec mount) into an actionable message.
+preflight_kernel() { # preflight_kernel KERNEL_FILE
+  local k="$1"
+  if [ ! -s "$k" ]; then
+    echo "[ERROR] Kernel missing/empty: $k (run with --reinstall?)" >&2
+    return 1
+  fi
+  if ! head -c 4 "$k" 2>/dev/null | grep -q ELF; then
+    echo "[ERROR] $k is not an ELF binary (download corrupted?)." >&2
+    echo "        Re-download with --reinstall." >&2
+    return 1
+  fi
+  chmod +x "$k" 2>/dev/null || true
+  if [ ! -x "$k" ]; then
+    echo "[ERROR] Cannot make executable: $k (noexec mount? copy to an exec-allowed dir" >&2
+    echo "        or set UML_DATA_DIR to one, e.g. UML_DATA_DIR=\$HOME/uml)." >&2
+    return 1
+  fi
+  # Dry-run: a UML kernel prints help/usage quickly; failure here predicts
+  # the exec failure below (e.g. missing /lib/ld-linux on Android/Alpine).
+  # NOTE: `rc=$?` must come from `||` ($? after `if ! cmd` is always 0).
+  local rc=0
+  "$k" --help >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
+      echo "[ERROR] Cannot execute $k (exit $rc: missing loader or noexec mount)." >&2
+      if is_android; then
+        echo "        This is Android (bionic): the glibc UML kernel cannot run here." >&2
+        echo "        You likely have a stale glibc 'linux' - re-run with the bionic assets:" >&2
+        echo "          ./run.sh --reinstall   (auto-picks linux-bionic on Android/arm64)" >&2
+        echo "        Or manual swap:" >&2
+        echo "          curl -fSL -o linux https://github.com/${REPO}/releases/latest/download/linux-bionic" >&2
+        echo "          curl -fSL -o vde_plug https://github.com/${REPO}/releases/latest/download/vde_plug-android-arm64" >&2
+        echo "          chmod +x linux vde_plug" >&2
+        echo "        Fallback: run inside a glibc proot distro (proot-distro login debian)." >&2
+      elif [ ! -f "/lib/ld-linux-aarch64.so.1" ] && [ ! -f "/lib64/ld-linux-x86-64.so.2" ] && [ ! -f "/lib/ld-linux-x86-64.so.2" ]; then
+        echo "        No glibc loader found - musl/Alpine or minimal rootfs?" >&2
+        echo "        Install glibc compat (e.g. apk add gcompat libc6-compat) or boot on glibc Linux." >&2
+      else
+      echo "        Check: file $k ; mount | grep -E 'noexec.*(${DATA_DIR}|/tmp)'" >&2
+    fi
+    return 1
+  fi
+  # Any other exit code (e.g. UML prints usage with rc!=0) is fine.
+  return 0
 }
 
 do_install() {
@@ -346,12 +450,28 @@ do_install() {
   echo "==> Downloading UML kernel and networking tools..."
   download "${BASE_URL}/${KERNEL_ASSET}" "$DATA_DIR/linux"
   download "${BASE_URL}/${VDE_ASSET}" "$DATA_DIR/vde_plug"
+  # Verify downloads: GitHub error pages are tiny HTML, real assets are MBs.
+  for _f in "$DATA_DIR/linux" "$DATA_DIR/vde_plug"; do
+    if [ ! -s "$_f" ]; then
+      echo "[ERROR] Download failed/empty: $_f (check network + asset ${KERNEL_ASSET}/${VDE_ASSET})" >&2
+      return 1
+    fi
+  done
+  if head -c 15 "$DATA_DIR/linux" 2>/dev/null | grep -q '<'; then
+    echo "[ERROR] Kernel download looks like an HTML error page, not a binary." >&2
+    echo "        Check https://github.com/${REPO}/releases for ${KERNEL_ASSET}." >&2
+    return 1
+  fi
   # NOTE: upstream dropped standalone slirp binaries (v2026.09.26-18+);
   # networking is provided via vde_plug, so no slirp download needed.
   rm -f "$DATA_DIR/slirp" "$BASE/slirp"
 
   echo "==> Downloading rootfs image ${image_gz}..."
   download "${BASE_URL}/${image_gz}" "$DATA_DIR/rootfs.img.gz"
+  if [ ! -s "$DATA_DIR/rootfs.img.gz" ]; then
+    echo "[ERROR] Rootfs download failed/empty: ${image_gz}" >&2
+    return 1
+  fi
 
   if [ ! -f "$CONFIG" ] || [ "$REINSTALL" -eq 1 ]; then
     echo "==> Downloading default config.yaml..."
@@ -431,6 +551,16 @@ do_boot() {
   done
   if [ ! -x "$DATA_DIR/vde_plug" ]; then chmod +x "$DATA_DIR/vde_plug"; fi
   if [ ! -x "$KERNEL" ]; then chmod +x "$KERNEL"; fi
+
+  # Fail fast with a clear message instead of cryptic exec errors
+  # (Android/bionic, noexec mounts, truncated downloads).
+  # Set UML_IGNORE_PREFLIGHT=1 to attempt boot anyway.
+  if [ -z "${UML_IGNORE_PREFLIGHT:-}" ]; then
+    preflight_kernel "$KERNEL" || exit 1
+  fi
+  if is_android; then
+    echo "[!] Android detected: if boot fails, run inside proot-distro Debian instead." >&2
+  fi
 
   KERNEL_HAS_SMP=0
   if command -v strings >/dev/null 2>&1 && strings "$KERNEL" 2>/dev/null | grep -q '^CONFIG_SMP=y'; then

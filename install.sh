@@ -3,7 +3,39 @@
 # For one-step install+boot, use run.sh instead.
 set -euo pipefail
 
-BASE="$(cd "$(dirname "$0")" && pwd)"
+resolve_base() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  case "$src" in
+    bash|sh|dash|*busybox*|"") src="" ;;
+  esac
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    local dd name d
+    dd="$(dirname "$src")"; name="$(basename "$src")"
+    d="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    d="$(cd "$dd" 2>/dev/null && pwd 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    if cd "$dd" 2>/dev/null && [ -f "$name" ]; then
+      case "${PWD:-}" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac
+    fi
+  fi
+  local d
+  d="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "${PWD:-}")"
+  if [ -n "$d" ]; then case "$d" in /*) [ -d "$d" ] && { echo "$d"; return 0; } ;; esac; fi
+  if [ -n "${PWD:-}" ]; then case "$PWD" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac; fi
+  echo "/tmp"
+}
+BASE="$(resolve_base)"
+if ! pwd >/dev/null 2>&1; then
+  if [ -d "$BASE" ] && cd "$BASE" 2>/dev/null && mkdir -p "$BASE" 2>/dev/null; then
+    echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
+    echo "    anchored to $BASE, continuing with absolute paths." >&2
+  else
+    echo "[ERROR] Current directory is inaccessible and '$BASE' is unusable." >&2
+    echo "        cd to a real, writable directory first." >&2
+    exit 1
+  fi
+fi
 DATA_DIR="${UML_DATA_DIR:-$BASE}"
 
 REPO="dxomg/uml-kernel-build"
@@ -14,10 +46,22 @@ apply_arch() {
     x86_64|amd64)
       ARCH_LABEL="x86_64"; IMG_SUFFIX=""; KERNEL_ASSET="linux-uml"; VDE_ASSET="vde_plug-x86_64" ;;
     arm64|aarch64)
-      ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64" ;;
+      ARCH_LABEL="arm64"; IMG_SUFFIX="-arm64"; KERNEL_ASSET="linux-uml-arm64"; VDE_ASSET="vde_plug-arm64"
+      # Android arm64 cannot exec glibc binaries: use static bionic assets.
+      if is_android; then
+        KERNEL_ASSET="linux-bionic"; VDE_ASSET="vde_plug-android-arm64"
+      fi
+      ;;
     *) echo "Invalid --arch: $1 (use x86_64|arm64)" >&2; return 1 ;;
   esac
   UNAME_M="$1"
+}
+is_android() {
+  [ -n "${PREFIX:-}" ] && case "$PREFIX" in *com.termux*) return 0 ;; esac
+  [ -d "/system/app" ] && [ ! -d "/usr/bin" ] && return 0
+  [ -f "/system/build.prop" ] && ! command -v dpkg >/dev/null 2>&1 && return 0
+  [ "$(uname -o 2>/dev/null)" = "Android" ] && return 0
+  return 1
 }
 UNAME_M="${UML_ARCH:-$(uname -m 2>/dev/null || echo x86_64)}"
 case "$UNAME_M" in

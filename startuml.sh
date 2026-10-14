@@ -6,7 +6,39 @@
 #           UML_CONSOLE=fd|xterm|none, UML_MODE=seccomp|skas0|auto,
 #           MEMORY, NCPUS, TMP_DIR
 set -euo pipefail
-BASE="$(cd "$(dirname "$0")" && pwd)"
+resolve_base() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  case "$src" in
+    bash|sh|dash|*busybox*|"") src="" ;;
+  esac
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    local dd name d
+    dd="$(dirname "$src")"; name="$(basename "$src")"
+    d="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    d="$(cd "$dd" 2>/dev/null && pwd 2>/dev/null)" || d=""
+    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
+    if cd "$dd" 2>/dev/null && [ -f "$name" ]; then
+      case "${PWD:-}" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac
+    fi
+  fi
+  local d
+  d="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "${PWD:-}")"
+  if [ -n "$d" ]; then case "$d" in /*) [ -d "$d" ] && { echo "$d"; return 0; } ;; esac; fi
+  if [ -n "${PWD:-}" ]; then case "$PWD" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac; fi
+  echo "/tmp"
+}
+BASE="$(resolve_base)"
+if ! pwd >/dev/null 2>&1; then
+  if [ -d "$BASE" ] && cd "$BASE" 2>/dev/null && mkdir -p "$BASE" 2>/dev/null; then
+    echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
+    echo "    anchored to $BASE, continuing with absolute paths." >&2
+  else
+    echo "[ERROR] Current directory is inaccessible and '$BASE' is unusable." >&2
+    echo "        cd to a real, writable directory first." >&2
+    exit 1
+  fi
+fi
 DATA_DIR="${UML_DATA_DIR:-$BASE}"
 KERNEL="$DATA_DIR/linux"
 ROOTFS="$DATA_DIR/base.img"
@@ -73,7 +105,31 @@ for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
     if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f (run ./run.sh --reinstall or ./install.sh first)"; exit 1; fi
 done
 if [ ! -x "$DATA_DIR/vde_plug" ]; then chmod +x "$DATA_DIR/vde_plug"; fi
-if [ ! -x "$KERNEL" ]; then chmod +x "$KERNEL"; fi
+chmod +x "$KERNEL" 2>/dev/null || true
+if [ ! -x "$KERNEL" ]; then
+    echo "[ERROR] Cannot make executable: $KERNEL (noexec mount? move files to an exec-allowed dir" >&2
+    echo "        or set UML_DATA_DIR to one)." >&2
+    exit 1
+fi
+if ! head -c 4 "$KERNEL" 2>/dev/null | grep -q ELF; then
+    echo "[ERROR] $KERNEL is not an ELF binary - re-download (./run.sh --reinstall)." >&2
+    exit 1
+fi
+# Dry-run: predicts missing-loader/noexec failures (notably Android/bionic)
+# with a clear message instead of cryptic `No such file or directory`.
+# NOTE: `rc=$?` must come from `||` ($? after `if ! cmd` is always 0).
+rc=0
+if [ -z "${UML_IGNORE_PREFLIGHT:-}" ]; then
+  "$KERNEL" --help >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
+      echo "[ERROR] Cannot execute $KERNEL (exit $rc: missing loader or noexec mount)." >&2
+      if [ -d "/system/app" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
+          echo "        Android detected (bionic): run inside a glibc proot distro" >&2
+          echo "        (e.g. proot-distro login debian) instead of directly." >&2
+      fi
+      exit 1
+  fi
+fi
 
 # --- detect whether the kernel was built with SMP ---
 KERNEL_HAS_SMP=0
@@ -116,8 +172,9 @@ esac
 setup_tmpdir() {
   if [ -n "${TMP_DIR:-}" ]; then mkdir -p "$TMP_DIR" && echo "$TMP_DIR" && return 0; fi
   if [ "$ENV_KIND" = "pterodactyl" ]; then mkdir -p "$DATA_DIR/.uml_tmp" && echo "$DATA_DIR/.uml_tmp" && return 0; fi
-  local cand
-  for cand in "${XDG_RUNTIME_DIR:-}/uml-tmp" "/tmp/uml-$USER" "$DATA_DIR/.uml_tmp"; do
+  local cand _user
+  _user="${USER:-$(id -un 2>/dev/null || echo host)}"
+  for cand in "${XDG_RUNTIME_DIR:-}/uml-tmp" "/tmp/uml-$_user" "$DATA_DIR/.uml_tmp"; do
     [ -n "$cand" ] && [ "$cand" != "/uml-tmp" ] || continue
     if mkdir -p "$cand" 2>/dev/null; then
       local t; t=$(mktemp "$cand/.exec_XXXXXX" 2>/dev/null) || continue
