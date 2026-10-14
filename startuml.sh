@@ -6,38 +6,50 @@
 #           UML_CONSOLE=fd|xterm|none, UML_MODE=seccomp|skas0|auto,
 #           MEMORY, NCPUS, TMP_DIR
 set -euo pipefail
+dir_usable() { # mkdir + create/delete probe; needs no getcwd
+  [ -n "${1:-}" ] || return 1
+  mkdir -p "$1" 2>/dev/null || return 1
+  local t="$1/.uml_write_test_$$"
+  : > "$t" 2>/dev/null || return 1
+  rm -f "$t" 2>/dev/null || true
+  return 0
+}
 resolve_base() {
   local src="${BASH_SOURCE[0]:-$0}"
   case "$src" in
     bash|sh|dash|*busybox*|"") src="" ;;
   esac
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    local dd name d
+  local dd="" name="" cand=""
+  if [ -n "$src" ]; then
     dd="$(dirname "$src")"; name="$(basename "$src")"
-    d="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || d=""
-    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
-    d="$(cd "$dd" 2>/dev/null && pwd 2>/dev/null)" || d=""
-    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
-    if cd "$dd" 2>/dev/null && [ -f "$name" ]; then
-      case "${PWD:-}" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac
+    if [ -n "${PWD:-}" ]; then case "$PWD" in /*)
+      case "$dd" in
+        .) cand="$PWD" ;;
+        /*) cand="$dd" ;;
+        *) cand="$PWD/$dd" ;;
+      esac
+      [ -f "$cand/$name" ] && { echo "$cand"; return 0; }
+    ;; esac; fi
+    if [ -f "$src" ]; then
+      cand="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || cand=""
+      case "$cand" in /*) [ -f "$cand/$name" ] && { echo "$cand"; return 0; } ;; esac
     fi
   fi
-  local d
-  d="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "${PWD:-}")"
-  if [ -n "$d" ]; then case "$d" in /*) [ -d "$d" ] && { echo "$d"; return 0; } ;; esac; fi
-  if [ -n "${PWD:-}" ]; then case "$PWD" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac; fi
-  echo "/tmp"
+  if [ -n "${PWD:-}" ]; then case "$PWD" in /*)
+    dir_usable "$PWD" && { echo "$PWD"; return 0; }
+  ;; esac; fi
+  echo "."
 }
 BASE="$(resolve_base)"
+cd "$BASE" 2>/dev/null || true
+if ! dir_usable "$BASE"; then
+  echo "[ERROR] Working dir '$BASE' is not writable." >&2
+  echo "        cd to a real, writable directory first." >&2
+  exit 1
+fi
 if ! pwd >/dev/null 2>&1; then
-  if [ -d "$BASE" ] && cd "$BASE" 2>/dev/null && mkdir -p "$BASE" 2>/dev/null; then
-    echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
-    echo "    anchored to $BASE, continuing with absolute paths." >&2
-  else
-    echo "[ERROR] Current directory is inaccessible and '$BASE' is unusable." >&2
-    echo "        cd to a real, writable directory first." >&2
-    exit 1
-  fi
+  echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
+  echo "    continuing in $BASE - all paths work without it." >&2
 fi
 DATA_DIR="${UML_DATA_DIR:-$BASE}"
 KERNEL="$DATA_DIR/linux"
@@ -84,7 +96,19 @@ detect_env() {
 }
 ENV_KIND="$(detect_env)"
 UML_CONSOLE="${UML_CONSOLE:-fd}"
-UML_MODE="${UML_MODE:-seccomp}"
+is_android() {
+  [ -n "${PREFIX:-}" ] && case "$PREFIX" in *com.termux*) return 0 ;; esac
+  [ -d "/system/app" ] && [ ! -d "/usr/bin" ] && return 0
+  [ -f "/system/build.prop" ] && ! command -v dpkg >/dev/null 2>&1 && return 0
+  [ "$(uname -o 2>/dev/null)" = "Android" ] && return 0
+  return 1
+}
+# Android default is skas0: the seccomp fast path needs host close_range()
+# (Linux 5.9+) and fails there with "SECCOMP userspace requested but not
+# functional!". Explicit UML_MODE always wins.
+if [ -z "${UML_MODE:-}" ]; then
+  if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
+fi
 
 yaml_val() {
     grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'

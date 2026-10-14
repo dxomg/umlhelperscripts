@@ -7,48 +7,62 @@
 # Based from LNQuang
 set -euo pipefail
 
-# Resolve the repo dir robustly, including `curl ... | bash` (where $0 is
-# "bash"/"sh" and has no file) and shells where getcwd() fails (deleted cwd,
-# Android/bionic ERANGE). Result is validated absolute before use.
+# Resolve the repo dir without depending on getcwd(): on some systems
+# (deleted cwd, Android/bionic ERANGE) `pwd` fails AND bash's `cd` reports
+# failure even when the directory is perfectly usable. So: build candidate
+# paths as strings and validate with file probes only.
+dir_usable() { # mkdir + create/delete probe; needs no getcwd
+  [ -n "${1:-}" ] || return 1
+  mkdir -p "$1" 2>/dev/null || return 1
+  local t="$1/.uml_write_test_$$"
+  : > "$t" 2>/dev/null || return 1
+  rm -f "$t" 2>/dev/null || true
+  return 0
+}
 resolve_base() {
   local src="${BASH_SOURCE[0]:-$0}"
   case "$src" in
     bash|sh|dash|*busybox*|"") src="" ;;
   esac
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    local dd name d
+  local dd="" name="" cand=""
+  if [ -n "$src" ]; then
     dd="$(dirname "$src")"; name="$(basename "$src")"
-    d="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || d=""
-    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
-    d="$(cd "$dd" 2>/dev/null && pwd 2>/dev/null)" || d=""
-    case "$d" in /*) [ -f "$d/$name" ] && { echo "$d"; return 0; } ;; esac
-    # getcwd() broken but dir reachable by fd: cd there (subshell) and trust
-    # the shell's logically-tracked $PWD, verified via absolute -d probe.
-    if cd "$dd" 2>/dev/null && [ -f "$name" ]; then
-      case "${PWD:-}" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac
+    # 1) $PWD-anchored: pure string math + file probe, no cd/pwd/getcwd.
+    if [ -n "${PWD:-}" ]; then case "$PWD" in /*)
+      case "$dd" in
+        .) cand="$PWD" ;;
+        /*) cand="$dd" ;;
+        *) cand="$PWD/$dd" ;;
+      esac
+      [ -f "$cand/$name" ] && { echo "$cand"; return 0; }
+    ;; esac; fi
+    # 2) Classic cd+pwd (healthy systems; also repairs a stale $PWD).
+    if [ -f "$src" ]; then
+      cand="$(cd "$dd" 2>/dev/null && pwd -P 2>/dev/null)" || cand=""
+      case "$cand" in /*) [ -f "$cand/$name" ] && { echo "$cand"; return 0; } ;; esac
     fi
   fi
-  # Piped / stdin mode (or unresolvable file mode): fall back to a usable cwd.
-  local d
-  d="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "${PWD:-}")"
-  if [ -n "$d" ]; then case "$d" in /*) [ -d "$d" ] && { echo "$d"; return 0; } ;; esac; fi
-  if [ -n "${PWD:-}" ]; then case "$PWD" in /*) [ -d "$PWD" ] && { echo "$PWD"; return 0; } ;; esac; fi
-  echo "/tmp"
+  # 3) Piped mode / anything else: current dir, validated by usability probe.
+  if [ -n "${PWD:-}" ]; then case "$PWD" in /*)
+    dir_usable "$PWD" && { echo "$PWD"; return 0; }
+  ;; esac; fi
+  # 4) Last resort: relative operation. All file ops below resolve against
+  #    the live cwd fd, which works even with a broken getcwd().
+  echo "."
 }
 BASE="$(resolve_base)"
-# getcwd() may fail while the directory itself is fine (deleted cwd,
-# Android/bionic ERANGE). Re-anchor via absolute cd; only abort if the
-# directory is genuinely unusable.
+# Best-effort anchor: `cd` may *report* failure when getcwd is broken even
+# though the chdir worked, so ignore its status and verify by file probe.
+cd "$BASE" 2>/dev/null || true
+if ! dir_usable "$BASE"; then
+  echo "[ERROR] Working dir '$BASE' is not writable." >&2
+  echo "        cd to a real, writable directory first, e.g.:" >&2
+  echo "          mkdir -p /data/adb/uml && cd /data/adb/uml" >&2
+  exit 1
+fi
 if ! pwd >/dev/null 2>&1; then
-  if [ -d "$BASE" ] && cd "$BASE" 2>/dev/null && mkdir -p "$BASE" 2>/dev/null; then
-    echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
-    echo "    anchored to $BASE, continuing with absolute paths." >&2
-  else
-    echo "[ERROR] Current directory is inaccessible and '$BASE' is unusable." >&2
-    echo "        cd to a real, writable directory first, e.g.:" >&2
-    echo "          mkdir -p /data/adb/uml && cd /data/adb/uml" >&2
-    exit 1
-  fi
+  echo "[!] Note: getcwd() fails in this shell (deleted cwd or Android/bionic);" >&2
+  echo "    continuing in $BASE - all paths work without it." >&2
 fi
 # Allow regular-env users to keep data outside the repo checkout:
 #   UML_DATA_DIR=~/.local/share/uml ./run.sh
@@ -205,9 +219,11 @@ Options:
                     Env: UML_DATA_DIR.
   --console MODE    Guest console: fd (default, stdio, Pterodactyl-safe),
                     xterm, none. Env: UML_CONSOLE.
-  --mode MODE       Userspace mode: seccomp (default), skas0, auto.
+  --mode MODE       Userspace mode: seccomp (default, skas0 on Android),
+                    skas0, auto.
                     Env: UML_MODE. seccomp avoids /dev/shm via memfd
-                    backport; skas0 forces PTRACE fallback.
+                    backport; skas0 forces PTRACE fallback (needed on
+                    Android kernels without close_range).
   --reinstall       Force re-download even if files exist
   --install-only    Install but do not boot
   -h, --help        Show this help
@@ -259,7 +275,14 @@ resolve_image() {
 # --- parse args (flags + legacy [memory] [ncpus] positionals) ---
 WANT_IMAGE="${UML_IMAGE:-}"
 WANT_DISK="${UML_DISK_SIZE:-}"
-UML_MODE="${UML_MODE:-seccomp}"
+# Default userspace mode: seccomp everywhere, except Android where the
+# seccomp fast path often can't initialise (missing close_range on older
+# kernels: "SECCOMP userspace requested but not functional!"). skas0 is the
+# pure-ptrace fallback and works without seccomp filters or /dev/shm.
+# Explicit --mode / UML_MODE always wins.
+if [ -z "${UML_MODE:-}" ]; then
+  if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
+fi
 UML_CONSOLE="${UML_CONSOLE:-fd}"
 REINSTALL=0
 INSTALL_ONLY=0
