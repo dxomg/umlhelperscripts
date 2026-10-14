@@ -25,7 +25,9 @@ ports:
   - "8006:8006"
 
 # --- Launcher behaviour (all optional, env vars win over these) ---
-# Uncomment to pin instead of passing flags / env:
+# Uncomment to pin instead of passing flags / env.
+# (run.sh / install.sh ask for the userspace mode at install time and save
+# your pick as an active `mode:` line below.)
 # env: auto             # auto | pterodactyl | standard
 # arch: auto            # auto | x86_64 | arm64
 # console: fd           # fd | xterm | none

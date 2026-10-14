@@ -103,16 +103,14 @@ is_android() {
   [ "$(uname -o 2>/dev/null)" = "Android" ] && return 0
   return 1
 }
-# Android default is skas0: the seccomp fast path needs host close_range()
-# (Linux 5.9+) and fails there with "SECCOMP userspace requested but not
-# functional!". Explicit UML_MODE always wins.
-if [ -z "${UML_MODE:-}" ]; then
-  if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
-fi
-
 yaml_val() {
-    grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'
+    # Always succeeds (empty when absent): callers run under `set -e`.
+    grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"' || true
 }
+
+# Userspace mode resolution order: UML_MODE env > config.yaml > default
+# (skas0 on Android, seccomp elsewhere). run.sh --reinstall saves the
+# install-time pick into config.yaml so plain ./startuml.sh reuses it.
 
 # --- arguments: [memory] [ncpus]  (both optional, config.yaml overrides; env wins) ---
 MEMORY="${1:-${MEMORY:-$(yaml_val memory)}}"
@@ -124,6 +122,13 @@ case "$NCPUS" in
     ''|*[!0-9]*) NCPUS=1 ;;
 esac
 [ "$NCPUS" -lt 1 ] && NCPUS=1
+
+if [ -z "${UML_MODE:-}" ]; then
+  UML_MODE="$(yaml_val mode)"
+  if [ -z "$UML_MODE" ]; then
+    if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
+  fi
+fi
 
 for f in "$KERNEL" "$ROOTFS" "$DATA_DIR/vde_plug"; do
     if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f (run ./run.sh --reinstall or ./install.sh first)"; exit 1; fi
@@ -189,7 +194,7 @@ case "$UML_MODE" in
         if [ "$KERNEL_HAS_SMP" -eq 1 ]; then SMP_ARGS="ncpus=$NCPUS seccomp=on"
         elif [ "$SHM_OK" -eq 0 ]; then SKAS_MODE="mode=skas0"; fi
         ;;
-    *) echo "[ERROR] Invalid UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2; exit 1 ;;
+    *) echo "[ERROR] Invalid mode: $UML_MODE (use seccomp|skas0|auto; check UML_MODE, $CONFIG)" >&2; exit 1 ;;
 esac
 
 # --- tmpdir: pterodactyl pins $DATA_DIR/.uml_tmp; standard prefers exec-tested /tmp ---

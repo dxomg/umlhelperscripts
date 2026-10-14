@@ -224,6 +224,9 @@ Options:
                     Env: UML_MODE. seccomp avoids /dev/shm via memfd
                     backport; skas0 forces PTRACE fallback (needed on
                     Android kernels without close_range).
+                    On install (interactive TTY, mode not given) you are
+                    asked to pick; the pick is saved to config.yaml and
+                    reused by later boots (incl. startuml.sh).
   --reinstall       Force re-download even if files exist
   --install-only    Install but do not boot
   -h, --help        Show this help
@@ -275,14 +278,13 @@ resolve_image() {
 # --- parse args (flags + legacy [memory] [ncpus] positionals) ---
 WANT_IMAGE="${UML_IMAGE:-}"
 WANT_DISK="${UML_DISK_SIZE:-}"
-# Default userspace mode: seccomp everywhere, except Android where the
-# seccomp fast path often can't initialise (missing close_range on older
-# kernels: "SECCOMP userspace requested but not functional!"). skas0 is the
-# pure-ptrace fallback and works without seccomp filters or /dev/shm.
-# Explicit --mode / UML_MODE always wins.
-if [ -z "${UML_MODE:-}" ]; then
-  if is_android; then UML_MODE="skas0"; else UML_MODE="seccomp"; fi
-fi
+# Userspace mode is intentionally left empty unless explicitly given: the
+# install step asks interactively (TTY) and saves the pick to config.yaml;
+# boot resolves: explicit --mode/UML_MODE > config.yaml > platform default
+# (seccomp, or skas0 on Android where seccomp often can't initialise:
+# missing close_range -> "SECCOMP userspace requested but not functional!").
+MODE_EXPLICIT=0
+if [ -n "${UML_MODE:-}" ]; then MODE_EXPLICIT=1; fi
 UML_CONSOLE="${UML_CONSOLE:-fd}"
 REINSTALL=0
 INSTALL_ONLY=0
@@ -304,8 +306,8 @@ while [ $# -gt 0 ]; do
     --data-dir=*) DATA_DIR="${1#--data-dir=}"; KERNEL="$DATA_DIR/linux"; ROOTFS="$DATA_DIR/base.img"; CONFIG="$DATA_DIR/config.yaml"; mkdir -p "$DATA_DIR"; shift ;;
     --console) UML_CONSOLE="${2:-fd}"; shift 2 ;;
     --console=*) UML_CONSOLE="${1#--console=}"; shift ;;
-    --mode) UML_MODE="${2:-}"; shift 2 ;;
-    --mode=*) UML_MODE="${1#--mode=}"; shift ;;
+    --mode) UML_MODE="${2:-}"; MODE_EXPLICIT=1; shift 2 ;;
+    --mode=*) UML_MODE="${1#--mode=}"; MODE_EXPLICIT=1; shift ;;
     -l|--list) list_images; exit 0 ;;
     --reinstall) REINSTALL=1; shift ;;
     --install-only) INSTALL_ONLY=1; shift ;;
@@ -316,6 +318,14 @@ while [ $# -gt 0 ]; do
 done
 MEMORY_ARG="${POS[0]:-}"
 NCPUS_ARG="${POS[1]:-}"
+
+# Fail fast on an invalid explicit mode (typo in --mode/UML_MODE).
+if [ "$MODE_EXPLICIT" -eq 1 ] && [ -n "${UML_MODE:-}" ]; then
+  case "$UML_MODE" in
+    seccomp|skas0|auto) ;;
+    *) echo "[ERROR] Invalid --mode/UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2; exit 1 ;;
+  esac
+fi
 
 need_install() {
   [ "$REINSTALL" -eq 1 ] && return 0
@@ -550,12 +560,54 @@ do_install() {
     fi
   fi
 
+  # --- userspace mode choice (asked once at install, saved to config.yaml) ---
+  if [ "$MODE_EXPLICIT" -eq 0 ] && [ -t 0 ]; then
+    local _def="seccomp"
+    if is_android; then _def="skas0"; fi
+    echo ""
+    echo "Userspace mode (how the UML kernel runs):"
+    echo "  1) seccomp - fast path; needs host close_range() (breaks on older Android kernels)"
+    echo "  2) skas0   - ptrace fallback; slower, works everywhere incl. Android"
+    echo "  3) auto    - seccomp where possible, skas0 fallback otherwise"
+    local _pick=""
+    read -rp "Select mode [1-3] (default: $_def): " _pick || true
+    case "${_pick:-}" in
+      1) UML_MODE="seccomp" ;;
+      2) UML_MODE="skas0" ;;
+      3) UML_MODE="auto" ;;
+      "") UML_MODE="$_def" ;;
+      seccomp|skas0|auto) UML_MODE="$_pick" ;;
+      *) echo "(!) Unknown mode '$_pick', keeping default: $_def" >&2; UML_MODE="$_def" ;;
+    esac
+  fi
+  if [ -n "${UML_MODE:-}" ]; then
+    persist_config_mode "$UML_MODE" && echo "==> Userspace mode '$UML_MODE' saved to $CONFIG"
+  fi
+
   echo "==> Install complete: kernel=${KERNEL_ASSET}, image=${image_gz} -> base.img"
   echo ""
 }
 
 yaml_val() {
-  grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'
+  # Always succeeds (empty when absent): callers run under `set -e`.
+  grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"' || true
+}
+
+# Remember the userspace mode pick in config.yaml so later boots
+# (incl. startuml.sh) reuse it without asking again.
+persist_config_mode() {
+  local m="$1"
+  case "$m" in seccomp|skas0|auto) ;; *) return 0 ;; esac
+  if [ ! -f "$CONFIG" ]; then
+    printf '# Written by run.sh install\nmemory: 2G\nncpus: 1\nmode: %s\n' "$m" > "$CONFIG" 2>/dev/null || return 1
+    return 0
+  fi
+  if grep -Eq '^[#[:space:]]*mode:' "$CONFIG" 2>/dev/null; then
+    sed -i "s/^[#[:space:]]*mode:.*/mode: $m/" "$CONFIG" 2>/dev/null || return 1
+  else
+    printf 'mode: %s\n' "$m" >> "$CONFIG" 2>/dev/null || return 1
+  fi
+  return 0
 }
 
 do_boot() {
@@ -603,11 +655,15 @@ do_boot() {
   SMP_ARGS=""
   SKAS_MODE=""
 
-  # Userspace mode (default: seccomp instead of skas0).
+  # Userspace mode, resolved: explicit --mode/UML_MODE > config.yaml > default.
   #   seccomp: always pass seccomp=on (memfd physmem backport, no /dev/shm dep).
-  #   skas0:   force PTRACE fallback when /dev/shm is slow.
+  #   skas0:   force PTRACE fallback when /dev/shm is slow / seccomp unavailable.
   #   auto:    legacy behavior (seccomp on SMP kernels, skas0 fallback on UP).
-  case "$UML_MODE" in
+  local mode="${UML_MODE:-$(yaml_val mode)}"
+  if [ -z "$mode" ]; then
+    if is_android; then mode="skas0"; else mode="seccomp"; fi
+  fi
+  case "$mode" in
     seccomp)
       if [ "$KERNEL_HAS_SMP" -eq 1 ]; then
         SMP_ARGS="ncpus=$ncpus seccomp=on"
@@ -635,7 +691,7 @@ do_boot() {
       fi
       ;;
     *)
-      echo "[ERROR] Invalid UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2
+      echo "[ERROR] Invalid mode: $mode (use seccomp|skas0|auto; check --mode, UML_MODE, $CONFIG)" >&2
       exit 1
       ;;
   esac

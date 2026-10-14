@@ -144,6 +144,9 @@ Options:
                     Env: UML_ARCH.
   --env ENV         Override env: auto (default), pterodactyl, standard. Env: UML_ENV.
   --data-dir DIR    Install into DIR instead of script dir. Env: UML_DATA_DIR.
+  -m, --mode MODE   Userspace mode: seccomp (default, skas0 on Android),
+                    skas0, auto. Env: UML_MODE. Saved to config.yaml.
+                    Without it, interactive terminals are asked at install.
   -h, --help        Show this help
 
 IMAGE can be:
@@ -164,6 +167,8 @@ EOF
 # --- parse args ---
 ACTION="install"
 WANT="${UML_IMAGE:-}"
+MODE_EXPLICIT=0
+if [ -n "${UML_MODE:-}" ]; then MODE_EXPLICIT=1; fi
 while [ $# -gt 0 ]; do
   case "$1" in
     -l|--list) ACTION="list"; shift ;;
@@ -175,6 +180,8 @@ while [ $# -gt 0 ]; do
     --env=*) UML_ENV="${1#--env=}"; ENV_KIND="$(detect_env)"; shift ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
     --data-dir=*) DATA_DIR="${1#--data-dir=}"; shift ;;
+    -m|--mode) UML_MODE="${2:-}"; MODE_EXPLICIT=1; shift 2 ;;
+    --mode=*) UML_MODE="${1#--mode=}"; MODE_EXPLICIT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     *) WANT="$1"; shift ;;
@@ -184,6 +191,14 @@ done
 if [ "$ACTION" = "list" ]; then
   list_images
   exit 0
+fi
+
+# Fail fast on an invalid explicit mode (typo in --mode/UML_MODE).
+if [ "$MODE_EXPLICIT" -eq 1 ] && [ -n "${UML_MODE:-}" ]; then
+  case "$UML_MODE" in
+    seccomp|skas0|auto) ;;
+    *) echo "[ERROR] Invalid --mode/UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2; exit 1 ;;
+  esac
 fi
 
 resolve_image() {
@@ -275,6 +290,45 @@ chmod +x "$DATA_DIR/linux" "$DATA_DIR/vde_plug" "$BASE/startuml.sh" "$BASE/resiz
 echo "==> Extracting rootfs image to base.img..."
 gunzip -f "$DATA_DIR/rootfs.img.gz"
 mv -f "$DATA_DIR/rootfs.img" "$DATA_DIR/base.img"
+
+# --- userspace mode choice (asked once at install, saved to config.yaml) ---
+if [ "$MODE_EXPLICIT" -eq 0 ] && [ -t 0 ]; then
+  _def="seccomp"
+  if is_android; then _def="skas0"; fi
+  echo ""
+  echo "Userspace mode (how the UML kernel runs):"
+  echo "  1) seccomp - fast path; needs host close_range() (breaks on older Android kernels)"
+  echo "  2) skas0   - ptrace fallback; slower, works everywhere incl. Android"
+  echo "  3) auto    - seccomp where possible, skas0 fallback otherwise"
+  _pick=""
+  read -rp "Select mode [1-3] (default: $_def): " _pick || true
+  case "${_pick:-}" in
+    1) UML_MODE="seccomp" ;;
+    2) UML_MODE="skas0" ;;
+    3) UML_MODE="auto" ;;
+    "") UML_MODE="$_def" ;;
+    seccomp|skas0|auto) UML_MODE="$_pick" ;;
+    *) echo "(!) Unknown mode '$_pick', keeping default: $_def" >&2; UML_MODE="$_def" ;;
+  esac
+fi
+if [ -n "${UML_MODE:-}" ]; then
+  _cfg="$DATA_DIR/config.yaml"
+  case "$UML_MODE" in seccomp|skas0|auto)
+    if [ ! -f "$_cfg" ]; then
+      printf '# Written by install.sh\nmemory: 2G\nncpus: 1\nmode: %s\n' "$UML_MODE" > "$_cfg" 2>/dev/null || true
+    elif grep -Eq '^[#[:space:]]*mode:' "$_cfg" 2>/dev/null; then
+      sed -i "s/^[#[:space:]]*mode:.*/mode: $UML_MODE/" "$_cfg" 2>/dev/null || true
+    else
+      printf 'mode: %s\n' "$UML_MODE" >> "$_cfg" 2>/dev/null || true
+    fi
+    echo "==> Userspace mode '$UML_MODE' saved to $_cfg"
+    ;;
+  *)
+    echo "[ERROR] Invalid mode: $UML_MODE (use seccomp|skas0|auto)" >&2
+    exit 1
+    ;;
+  esac
+fi
 
 echo "==> Setup complete!"
 echo ""
