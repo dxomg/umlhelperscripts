@@ -337,6 +337,14 @@ if [ "$MODE_EXPLICIT" -eq 1 ] && [ -n "${UML_MODE:-}" ]; then
   esac
 fi
 
+# Fail fast on an invalid explicit init (typo in --init/UML_INIT).
+if [ -n "${UML_INIT_ARG:-${UML_INIT:-}}" ]; then
+  case "${UML_INIT_ARG:-$UML_INIT}" in
+    /*) ;;
+    *) echo "[ERROR] Invalid --init/UML_INIT: ${UML_INIT_ARG:-$UML_INIT} (use an absolute guest path)" >&2; exit 1 ;;
+  esac
+fi
+
 need_install() {
   [ "$REINSTALL" -eq 1 ] && return 0
   [ ! -f "$KERNEL" ] && return 0
@@ -723,6 +731,11 @@ do_install() {
   if [ -n "${UML_MODE:-}" ]; then
     persist_config_mode "$UML_MODE" && echo "==> Userspace mode '$UML_MODE' saved to $CONFIG"
   fi
+  if [ -n "${UML_INIT_ARG:-${UML_INIT:-}}" ]; then
+    if persist_config_init "${UML_INIT_ARG:-$UML_INIT}"; then
+      echo "==> Guest init '${UML_INIT_ARG:-$UML_INIT}' saved to $CONFIG"
+    fi
+  fi
   write_manifest "$image_gz"
   write_installed_marker "$image_gz"
 
@@ -740,10 +753,12 @@ yaml_val() {
 }
 
 # Auto-detect the guest init binary so non-systemd images (e.g. Alpine with
-# OpenRC, /sbin/init) boot without manual --init. Probes well-known paths
-# inside the ext4 rootfs with debugfs (read-only, no root/mount needed);
-# falls back to a distro-name heuristic when debugfs is unavailable.
-# Prints the path, or nothing (caller keeps its default).
+# OpenRC, /sbin/init) boot without manual --init. Zero new dependencies:
+# distro-name heuristic, then a debugfs probe if debugfs happens to be
+# present (read-only, no root/mount), then a raw byte scan for the systemd
+# path with plain grep (systemd images always carry those bytes, e.g. in the
+# /sbin/init symlink body). Prints the path, or /sbin/init as the
+# kernel-default guess when systemd traces are absent.
 detect_guest_init() { # detect_guest_init IMG [IMAGE_NAME]
   local img="$1" iname="${2:-}" cand out
   case "$iname" in
@@ -757,6 +772,15 @@ detect_guest_init() { # detect_guest_init IMG [IMAGE_NAME]
         *"Inode:"*) echo "$cand"; return 0 ;;
       esac
     done
+  fi
+  if [ -f "$img" ]; then
+    if grep -a -m1 -q -E '/lib/systemd/systemd' "$img" 2>/dev/null; then
+      echo "/lib/systemd/systemd"; return 0
+    fi
+    if grep -a -m1 -q -E '/usr/lib/systemd/systemd' "$img" 2>/dev/null; then
+      echo "/usr/lib/systemd/systemd"; return 0
+    fi
+    echo "/sbin/init"; return 0
   fi
   return 1
 }
@@ -774,6 +798,28 @@ persist_config_mode() {
     sed -i "s/^[#[:space:]]*mode:.*/mode: $m/" "$CONFIG" 2>/dev/null || return 1
   else
     printf 'mode: %s\n' "$m" >> "$CONFIG" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+# Remember an explicitly given init (--init/UML_INIT) in config.yaml.
+# Auto-detected values are deliberately NOT persisted: the image file may be
+# swapped later, and detection re-runs every boot anyway.
+persist_config_init() {
+  local p="$1"
+  [ -n "$p" ] || return 0
+  case "$p" in
+    /*) ;;
+    *) echo "[ERROR] Invalid init path: $p (use an absolute guest path)" >&2; return 1 ;;
+  esac
+  if [ ! -f "$CONFIG" ]; then
+    printf '# Written by run.sh install\nmemory: 2G\nncpus: 1\ninit: %s\n' "$p" > "$CONFIG" 2>/dev/null || return 1
+    return 0
+  fi
+  if grep -Eq '^[#[:space:]]*init:' "$CONFIG" 2>/dev/null; then
+    sed -i "s|^[#[:space:]]*init:.*|init: $p|" "$CONFIG" 2>/dev/null || return 1
+  else
+    printf 'init: %s\n' "$p" >> "$CONFIG" 2>/dev/null || return 1
   fi
   return 0
 }

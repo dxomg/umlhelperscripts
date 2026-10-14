@@ -150,6 +150,8 @@ Options:
   -m, --mode MODE   Userspace mode: seccomp (default, skas0 on Android),
                     skas0, auto. Env: UML_MODE. Saved to config.yaml.
                     Without it, interactive terminals are asked at install.
+  --init PATH       Guest init binary. Env: UML_INIT. Saved to config.yaml.
+                    Without it, auto-detected from the image at boot.
   -h, --help        Show this help
 
 IMAGE can be:
@@ -185,6 +187,8 @@ while [ $# -gt 0 ]; do
     --data-dir=*) DATA_DIR="${1#--data-dir=}"; shift ;;
     -m|--mode) UML_MODE="${2:-}"; MODE_EXPLICIT=1; shift 2 ;;
     --mode=*) UML_MODE="${1#--mode=}"; MODE_EXPLICIT=1; shift ;;
+    --init) UML_INIT="${2:-}"; shift 2 ;;
+    --init=*) UML_INIT="${1#--init=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     *) WANT="$1"; shift ;;
@@ -201,6 +205,14 @@ if [ "$MODE_EXPLICIT" -eq 1 ] && [ -n "${UML_MODE:-}" ]; then
   case "$UML_MODE" in
     seccomp|skas0|auto) ;;
     *) echo "[ERROR] Invalid --mode/UML_MODE: $UML_MODE (use seccomp|skas0|auto)" >&2; exit 1 ;;
+  esac
+fi
+
+# Fail fast on an invalid explicit init (typo in --init/UML_INIT).
+if [ -n "${UML_INIT:-}" ]; then
+  case "$UML_INIT" in
+    /*) ;;
+    *) echo "[ERROR] Invalid --init/UML_INIT: $UML_INIT (use an absolute guest path)" >&2; exit 1 ;;
   esac
 fi
 
@@ -346,6 +358,20 @@ if [ -n "${UML_MODE:-}" ]; then
     exit 1
     ;;
   esac
+fi
+# Remember an explicitly given init (--init/UML_INIT) so later boots reuse
+# it. Auto-detected values are deliberately NOT persisted: the image file may
+# be swapped later, and detection re-runs every boot anyway.
+if [ -n "${UML_INIT:-}" ]; then
+  _cfg="$DATA_DIR/config.yaml"
+  if [ ! -f "$_cfg" ]; then
+    printf '# Written by install.sh\nmemory: 2G\nncpus: 1\ninit: %s\n' "$UML_INIT" > "$_cfg" 2>/dev/null || true
+  elif grep -Eq '^[#[:space:]]*init:' "$_cfg" 2>/dev/null; then
+    sed -i "s|^[#[:space:]]*init:.*|init: $UML_INIT|" "$_cfg" 2>/dev/null || true
+  else
+    printf 'init: %s\n' "$UML_INIT" >> "$_cfg" 2>/dev/null || true
+  fi
+  echo "==> Guest init '$UML_INIT' saved to $_cfg"
 fi
 
 echo "==> Setup complete!"

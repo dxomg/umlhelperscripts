@@ -130,6 +130,15 @@ detect_guest_init() { # detect_guest_init IMG [IMAGE_NAME]
             esac
         done
     fi
+    if [ -f "$img" ]; then
+        if grep -a -m1 -q -E '/lib/systemd/systemd' "$img" 2>/dev/null; then
+            echo "/lib/systemd/systemd"; return 0
+        fi
+        if grep -a -m1 -q -E '/usr/lib/systemd/systemd' "$img" 2>/dev/null; then
+            echo "/usr/lib/systemd/systemd"; return 0
+        fi
+        echo "/sbin/init"; return 0
+    fi
     return 1
 }
 
